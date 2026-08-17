@@ -65,6 +65,9 @@ cargo test --workspace --all-targets --locked
 The six-target native GitHub Actions matrix is the release gate. Every release
 job runs the ordinary-user conformance suite, builds and executes the native
 binary, and produces one archive containing exactly one `reach` executable.
+The successful 0.1.0 native capability evidence is recorded in
+`docs/0.1.0-native-capability-matrix.md`; the 0.1.1 output, test, CI, and
+artifact evidence is recorded in `docs/0.1.1-release-evidence.md`.
 
 ## Architecture and dependency policy
 
