@@ -35,11 +35,17 @@ fn redirected_help_is_plain_stdout_without_progress_or_ansi() {
 
 #[test]
 fn ordinary_user_loopback_success_is_a_completed_stdout_result() {
-    let assertion = cargo_bin_cmd!("reach").arg("127.0.0.1").assert().code(0);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local TCP success fixture");
+    let port = listener.local_addr().expect("local fixture address").port();
+
+    let assertion = cargo_bin_cmd!("reach")
+        .args(["127.0.0.1", &port.to_string()])
+        .assert()
+        .code(0);
     let output = assertion.get_output();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("result: all targets satisfied"));
-    assert!(stdout.contains("target 127.0.0.1: satisfied"));
+    assert!(stdout.contains(&format!("target 127.0.0.1:{port}: satisfied")));
     assert!(!stdout.contains('\u{1b}'));
     assert!(
         stdout.lines().count() <= 8,
