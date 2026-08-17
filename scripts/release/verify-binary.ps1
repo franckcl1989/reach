@@ -11,14 +11,24 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $false
 $binary = (Resolve-Path -LiteralPath $Path).Path
 $evidence = [System.Collections.Generic.List[string]]::new()
 
 switch ($Platform) {
     'linux' {
         $programHeaders = (& readelf -lW $binary 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0) {
+            throw 'readelf program-header inspection failed'
+        }
         $dynamic = (& readelf -dW $binary 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0) {
+            throw 'readelf dynamic-section inspection failed'
+        }
         $versions = (& readelf --version-info $binary 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0) {
+            throw 'readelf symbol-version inspection failed'
+        }
         $evidence.Add("readelf -lW`n$programHeaders")
         $evidence.Add("readelf -dW`n$dynamic")
         $evidence.Add("readelf --version-info`n$versions")
@@ -34,6 +44,9 @@ switch ($Platform) {
     }
     'macos' {
         $dependencies = (& otool -L $binary 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0) {
+            throw 'otool dependency inspection failed'
+        }
         $evidence.Add("otool -L`n$dependencies")
         $paths = $dependencies -split "`n" |
             Select-Object -Skip 1 |
@@ -47,12 +60,21 @@ switch ($Platform) {
     }
     'windows' {
         $rustSysroot = (rustc --print sysroot).Trim()
+        if ($LASTEXITCODE -ne 0) {
+            throw 'rustc sysroot discovery failed'
+        }
         $rustHost = ((rustc -vV | Select-String '^host:').ToString().Split(':')[1].Trim())
+        if ($LASTEXITCODE -ne 0) {
+            throw 'rustc host discovery failed'
+        }
         $llvmReadobj = Join-Path $rustSysroot "lib/rustlib/$rustHost/bin/llvm-readobj.exe"
         if (-not (Test-Path -LiteralPath $llvmReadobj -PathType Leaf)) {
             throw "llvm-readobj was not found at $llvmReadobj"
         }
         $imports = (& $llvmReadobj --coff-imports $binary 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0) {
+            throw 'llvm-readobj PE import inspection failed'
+        }
         $evidence.Add("llvm-readobj --coff-imports`n$imports")
         $dlls = $imports -split "`n" |
             ForEach-Object {

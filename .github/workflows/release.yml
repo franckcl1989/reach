@@ -205,6 +205,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
           foreach ($architecture in @('aarch64', 'x86_64')) {
             $directory = "extracted-$architecture"
             New-Item -ItemType Directory -Path $directory | Out-Null

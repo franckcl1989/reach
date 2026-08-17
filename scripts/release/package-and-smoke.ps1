@@ -17,6 +17,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $false
 $workspace = (Get-Location).Path
 $sourceBinary = (Resolve-Path -LiteralPath $BinaryPath).Path
 $work = Join-Path $workspace "release-work/$Artifact"
