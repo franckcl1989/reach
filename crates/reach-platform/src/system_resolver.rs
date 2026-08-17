@@ -594,7 +594,7 @@ mod tests {
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
-            vec!["corp.example."]
+            vec!["corp.example"]
         );
     }
 
