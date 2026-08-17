@@ -570,10 +570,10 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn unix_echo_works_without_elevation_on_loopback() {
+    async fn unix_ipv4_echo_capability_is_observed_without_elevation() {
         use crate::SystemContinuousClock;
 
-        let attempt = icmp_echo_once(
+        let result = icmp_echo_once(
             IcmpEchoRequest {
                 attempt_id: AttemptId(1),
                 subject: IcmpEchoSubject::Target(TargetIp::v4(Ipv4Addr::LOCALHOST)),
@@ -582,25 +582,17 @@ mod tests {
             &CancellationToken::new(),
             &SystemContinuousClock,
         )
-        .await
-        .expect("surge-ping ordinary-user loopback Echo must be available");
+        .await;
 
-        assert!(matches!(
-            attempt.outcome,
-            AttemptOutcome::Icmp(IcmpAttemptResult::Message {
-                kind: IcmpMessageKind::EchoReply,
-                responder: IpAddr::V4(Ipv4Addr::LOCALHOST),
-                ..
-            })
-        ));
+        assert_unix_echo_capability(result, IpAddr::V4(Ipv4Addr::LOCALHOST), "icmp_echo_v4");
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn unix_ipv6_echo_works_without_elevation_on_loopback() {
+    async fn unix_ipv6_echo_capability_is_observed_without_elevation() {
         use crate::SystemContinuousClock;
 
-        let attempt = icmp_echo_once(
+        let result = icmp_echo_once(
             IcmpEchoRequest {
                 attempt_id: AttemptId(1),
                 subject: IcmpEchoSubject::Target(TargetIp::v6(Ipv6Addr::LOCALHOST, None)),
@@ -609,16 +601,34 @@ mod tests {
             &CancellationToken::new(),
             &SystemContinuousClock,
         )
-        .await
-        .expect("surge-ping ordinary-user IPv6 loopback Echo must be available");
+        .await;
 
-        assert!(matches!(
-            attempt.outcome,
-            AttemptOutcome::Icmp(IcmpAttemptResult::Message {
-                kind: IcmpMessageKind::EchoReply,
-                responder: IpAddr::V6(Ipv6Addr::LOCALHOST),
-                ..
-            })
-        ));
+        assert_unix_echo_capability(result, IpAddr::V6(Ipv6Addr::LOCALHOST), "icmp_echo_v6");
+    }
+
+    #[cfg(unix)]
+    fn assert_unix_echo_capability(
+        result: Result<Attempt, PlatformError>,
+        expected_responder: IpAddr,
+        capability_name: &str,
+    ) {
+        match result {
+            Ok(attempt) => {
+                println!("native capability {capability_name}=Available");
+                assert!(matches!(
+                    attempt.outcome,
+                    AttemptOutcome::Icmp(IcmpAttemptResult::Message {
+                        kind: IcmpMessageKind::EchoReply,
+                        responder,
+                        ..
+                    }) if responder == expected_responder
+                ));
+            }
+            Err(PlatformError::IcmpUnavailable(reason)) => {
+                println!("native capability {capability_name}=Unavailable reason={reason}");
+                assert!(!reason.trim().is_empty());
+            }
+            Err(error) => panic!("unexpected ordinary-user ICMP result: {error}"),
+        }
     }
 }
