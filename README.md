@@ -54,8 +54,10 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
 ```
 
-The six-target native GitHub Actions matrix is the release gate. A successful
-job produces one archive containing exactly one `reach` executable.
+The six-target native GitHub Actions matrix is the release gate. The 0.1.0
+release run passed on Linux, macOS, and Windows for x86-64 and ARM64; every job
+produced one archive containing exactly one `reach` executable. Exact evidence
+and artifact digests are recorded in `docs/0.1.0-native-capability-matrix.md`.
 
 ## Architecture and dependency policy
 
