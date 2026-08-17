@@ -16,7 +16,7 @@ pub struct Theme {
 impl Theme {
     pub fn terminal() -> Self {
         let table_width = terminal_size::terminal_size()
-            .map(|(terminal_size::Width(width), _)| width.clamp(60, 140))
+            .map(|(terminal_size::Width(width), _)| width.clamp(1, 300))
             .unwrap_or(120);
         Self {
             styled: true,
@@ -32,8 +32,12 @@ impl Theme {
         }
     }
 
-    pub const fn table_width(self) -> Option<u16> {
-        self.table_width
+    #[cfg(test)]
+    pub const fn plain_with_width(width: u16) -> Self {
+        Self {
+            styled: false,
+            table_width: Some(width),
+        }
     }
 
     pub const fn content_width(self) -> usize {
@@ -65,10 +69,6 @@ impl Theme {
 
     pub fn heading(self, text: &str) -> String {
         self.paint(AnsiColor::Cyan.on_default().effects(Effects::BOLD), text)
-    }
-
-    pub fn strong(self, text: &str) -> String {
-        self.paint(Style::new().effects(Effects::BOLD), text)
     }
 }
 
@@ -120,13 +120,36 @@ pub fn write_output_error(
 }
 
 pub(crate) fn section(output: &mut String, theme: Theme, title: &str) {
-    let _ = writeln!(output, "{}", theme.heading(title));
+    let options = textwrap::Options::new(theme.content_width());
+    for line in textwrap::wrap(title, options) {
+        let _ = writeln!(output, "{}", theme.heading(&line));
+    }
 }
 
-pub(crate) fn field(output: &mut String, label: &str, value: impl AsRef<str>) {
-    let width = terminal_size::terminal_size()
-        .map(|(terminal_size::Width(width), _)| width.clamp(60, 140) as usize)
-        .unwrap_or(120);
+pub(crate) fn headline(
+    output: &mut String,
+    theme: Theme,
+    title: &str,
+    paint: fn(Theme, &str) -> String,
+) {
+    for line in textwrap::wrap(title, textwrap::Options::new(theme.content_width())) {
+        let _ = writeln!(output, "{}", paint(theme, &line));
+    }
+}
+
+pub(crate) fn field(output: &mut String, theme: Theme, label: &str, value: impl AsRef<str>) {
+    let width = theme.content_width();
+    if width < 40 {
+        let label_options = textwrap::Options::new(width)
+            .initial_indent("  ")
+            .subsequent_indent("  ");
+        let _ = writeln!(output, "{}", textwrap::fill(label, label_options));
+        let value_options = textwrap::Options::new(width)
+            .initial_indent("    ")
+            .subsequent_indent("    ");
+        let _ = writeln!(output, "{}", textwrap::fill(value.as_ref(), value_options));
+        return;
+    }
     let initial = format!("  {label:<18} ");
     let continuation = " ".repeat(initial.len());
     let options = textwrap::Options::new(width)
@@ -151,12 +174,6 @@ pub(crate) fn paragraph(output: &mut String, theme: Theme, value: &str) {
     let _ = writeln!(output, "{}", textwrap::fill(value, options));
 }
 
-pub(crate) fn indented_block(output: &mut String, value: &str) {
-    for line in value.lines() {
-        let _ = writeln!(output, "  {line}");
-    }
-}
-
 /// Preserves ordinary Unicode text while encoding terminal controls and all
 /// Unicode format characters. The general-category lookup is provided by the
 /// Unicode data crate rather than a locally maintained code-point blacklist.
@@ -179,6 +196,7 @@ mod tests {
     use reach_core::{Cancelled, DiagnosticResult, ExecutionError, ExecutionErrorKind, InputError};
     use snapbox::assert_data_eq;
     use snapbox::prelude::*;
+    use unicode_width::UnicodeWidthStr as _;
 
     use super::*;
 
@@ -312,6 +330,25 @@ TECHNICAL DETAILS
             assert!(output.contains("port\\u{1b}"));
             assert!(output.contains("Exit code          2"));
             assert!(!output.contains('\u{1b}'));
+        }
+    }
+
+    #[test]
+    fn error_layouts_from_twenty_to_three_hundred_columns_do_not_overflow() {
+        for width in [20_u16, 40, 59, 60, 80, 120, 140, 300] {
+            let output = error::render_input(
+                &InputError::InvalidPortSyntax,
+                "example.com",
+                Some("not-a-port"),
+                Theme::plain_with_width(width),
+            );
+            for line in output.lines() {
+                assert!(
+                    line.width() <= usize::from(width),
+                    "width {width}, rendered {} columns: {line:?}\n{output}",
+                    line.width()
+                );
+            }
         }
     }
 }

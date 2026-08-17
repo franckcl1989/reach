@@ -2,14 +2,19 @@ use std::fmt::Write as _;
 
 use reach_core::{
     Cancelled, CapabilityReason, EvidenceFact, ExecutionError, ExecutionErrorKind, InputError,
-    NeighborState,
+    NeighborObservation, NeighborState,
 };
 
-use super::{Theme, bullets, field, paragraph, section, terminal_escape};
+use super::{Theme, bullets, field, headline, paragraph, section, terminal_escape};
 
 pub(super) fn render_execution(error: &ExecutionError, theme: Theme) -> String {
     let mut output = String::new();
-    let _ = writeln!(output, "{}", theme.failure("× CHECK COULD NOT FINISH"));
+    headline(
+        &mut output,
+        theme,
+        "× CHECK COULD NOT FINISH",
+        Theme::failure,
+    );
     let _ = writeln!(output);
     paragraph(&mut output, theme, execution_explanation(error.kind));
     let _ = writeln!(output);
@@ -25,26 +30,31 @@ pub(super) fn render_execution(error: &ExecutionError, theme: Theme) -> String {
     let _ = writeln!(output);
 
     section(&mut output, theme, "TECHNICAL DETAILS");
-    field(&mut output, "Error type", execution_type(error.kind));
-    field(&mut output, "Reason", terminal_escape(&error.safe_message));
+    field(&mut output, theme, "Error type", execution_type(error.kind));
+    field(
+        &mut output,
+        theme,
+        "Reason",
+        terminal_escape(&error.safe_message),
+    );
     for evidence in &error.partial_evidence {
         let detail = match &evidence.fact {
             EvidenceFact::Attempt(id) => format!("Attempt A{} completed before the error", id.0),
             EvidenceFact::InitialPath(value) => {
-                format!("Initial path: {}", terminal_escape(value))
+                format!("Snapshot path inference: {}", terminal_escape(value))
             }
             EvidenceFact::CurrentPath(value) => {
-                format!("Current path: {}", terminal_escape(value))
+                format!("Targeted OS path query: {}", terminal_escape(value))
             }
             EvidenceFact::NeighborTransition { before, after } => {
                 format!(
                     "Neighbor: {} -> {}",
-                    before.map_or("not observed", neighbor_state),
+                    neighbor_observation(*before),
                     neighbor_state(*after)
                 )
             }
             EvidenceFact::SystemResolverResult(value) => {
-                format!("System DNS: {}", terminal_escape(value))
+                format!("System name resolution: {}", terminal_escape(value))
             }
             EvidenceFact::DirectDnsResult(value) => {
                 format!("Direct DNS diagnostic: {}", terminal_escape(value))
@@ -57,20 +67,33 @@ pub(super) fn render_execution(error: &ExecutionError, theme: Theme) -> String {
                 )
             }
             EvidenceFact::SnapshotInconsistency(value) => {
-                format!("Snapshot changed: {}", terminal_escape(value))
+                format!(
+                    "Snapshot cross-check inconsistency: {}",
+                    terminal_escape(value)
+                )
             }
             EvidenceFact::SocketPathComparison(value) => {
                 format!("Socket/path comparison: {}", terminal_escape(value))
             }
         };
-        field(&mut output, "Partial fact", detail);
+        field(&mut output, theme, "Partial fact", detail);
     }
-    field(&mut output, "Exit code", "2");
+    field(&mut output, theme, "Exit code", "2");
     output
+}
+
+fn neighbor_observation(value: NeighborObservation) -> &'static str {
+    match value {
+        NeighborObservation::NotSampled => "not sampled",
+        NeighborObservation::Observed(state) => neighbor_state(state),
+        NeighborObservation::Unknown => "unknown",
+        NeighborObservation::Unavailable => "unavailable",
+    }
 }
 
 fn neighbor_state(value: NeighborState) -> &'static str {
     match value {
+        NeighborState::Absent => "absent (no matching entry)",
         NeighborState::Resolving => "resolving",
         NeighborState::Usable => "usable",
         NeighborState::TerminalFailure => "terminal failure",
@@ -87,7 +110,7 @@ fn capability_reason(value: &CapabilityReason) -> String {
             "ordinary-user permission was denied".to_owned()
         }
         CapabilityReason::SnapshotInconsistent => {
-            "the network snapshot changed during capture".to_owned()
+            "a captured-fact cross-reference inconsistency was found".to_owned()
         }
         CapabilityReason::QuerySemanticsUnavailable => {
             "the required read-only query is unavailable".to_owned()
@@ -104,7 +127,7 @@ fn capability_reason(value: &CapabilityReason) -> String {
 
 pub(super) fn render_cancelled(cancelled: &Cancelled, theme: Theme) -> String {
     let mut output = String::new();
-    let _ = writeln!(output, "{}", theme.warning("! CHECK CANCELLED"));
+    headline(&mut output, theme, "! CHECK CANCELLED", Theme::warning);
     let _ = writeln!(output);
     paragraph(
         &mut output,
@@ -115,10 +138,11 @@ pub(super) fn render_cancelled(cancelled: &Cancelled, theme: Theme) -> String {
     section(&mut output, theme, "TECHNICAL DETAILS");
     field(
         &mut output,
+        theme,
         "Reason",
         terminal_escape(&cancelled.safe_message),
     );
-    field(&mut output, "Exit code", "130");
+    field(&mut output, theme, "Exit code", "130");
     output
 }
 
@@ -157,7 +181,7 @@ pub(super) fn render_input(
     };
 
     let mut output = String::new();
-    let _ = writeln!(output, "{}", theme.failure(&format!("× {title}")));
+    headline(&mut output, theme, &format!("× {title}"), Theme::failure);
     let _ = writeln!(output);
     paragraph(&mut output, theme, explanation);
     let _ = writeln!(output);
@@ -167,11 +191,11 @@ pub(super) fn render_input(
     write_usage(&mut output, theme);
     let _ = writeln!(output);
     section(&mut output, theme, "TECHNICAL DETAILS");
-    field(&mut output, "Address", terminal_escape(address));
+    field(&mut output, theme, "Address", terminal_escape(address));
     if let Some(port) = port {
-        field(&mut output, "Port", terminal_escape(port));
+        field(&mut output, theme, "Port", terminal_escape(port));
     }
-    field(&mut output, "Exit code", "2");
+    field(&mut output, theme, "Exit code", "2");
     output
 }
 
@@ -182,7 +206,7 @@ pub(super) fn render_command(missing_address: bool, theme: Theme) -> String {
     } else {
         "× COMMAND IS NOT VALID"
     };
-    let _ = writeln!(output, "{}", theme.failure(title));
+    headline(&mut output, theme, title, Theme::failure);
     let _ = writeln!(output);
     if missing_address {
         paragraph(
@@ -201,13 +225,18 @@ pub(super) fn render_command(missing_address: bool, theme: Theme) -> String {
     write_usage(&mut output, theme);
     let _ = writeln!(output);
     section(&mut output, theme, "TECHNICAL DETAILS");
-    field(&mut output, "Exit code", "2");
+    field(&mut output, theme, "Exit code", "2");
     output
 }
 
 pub(super) fn render_startup(reason: &str, theme: Theme) -> String {
     let mut output = String::new();
-    let _ = writeln!(output, "{}", theme.failure("× CHECK COULD NOT START"));
+    headline(
+        &mut output,
+        theme,
+        "× CHECK COULD NOT START",
+        Theme::failure,
+    );
     let _ = writeln!(output);
     paragraph(
         &mut output,
@@ -223,14 +252,19 @@ pub(super) fn render_startup(reason: &str, theme: Theme) -> String {
     );
     let _ = writeln!(output);
     section(&mut output, theme, "TECHNICAL DETAILS");
-    field(&mut output, "Reason", terminal_escape(reason));
-    field(&mut output, "Exit code", "2");
+    field(&mut output, theme, "Reason", terminal_escape(reason));
+    field(&mut output, theme, "Exit code", "2");
     output
 }
 
 pub(super) fn render_output_failure(reason: &str, theme: Theme) -> String {
     let mut output = String::new();
-    let _ = writeln!(output, "{}", theme.failure("× REPORT COULD NOT BE WRITTEN"));
+    headline(
+        &mut output,
+        theme,
+        "× REPORT COULD NOT BE WRITTEN",
+        Theme::failure,
+    );
     let _ = writeln!(output);
     paragraph(
         &mut output,
@@ -239,20 +273,26 @@ pub(super) fn render_output_failure(reason: &str, theme: Theme) -> String {
     );
     let _ = writeln!(output);
     section(&mut output, theme, "TECHNICAL DETAILS");
-    field(&mut output, "Reason", terminal_escape(reason));
-    field(&mut output, "Exit code", "2");
+    field(&mut output, theme, "Reason", terminal_escape(reason));
+    field(&mut output, theme, "Exit code", "2");
     output
 }
 
 fn write_usage(output: &mut String, theme: Theme) {
     section(output, theme, "USAGE");
-    let _ = writeln!(output, "  reach <ADDRESS> [PORT]");
+    paragraph(output, theme, "reach <ADDRESS> [PORT]");
     let _ = writeln!(output);
-    let _ = writeln!(output, "  Examples:");
-    let _ = writeln!(output, "    reach example.com");
-    let _ = writeln!(output, "    reach example.com 443");
-    let _ = writeln!(output, "    reach 192.0.2.10 22");
-    let _ = writeln!(output, "    reach fe80::1%12");
+    paragraph(output, theme, "Examples:");
+    bullets(
+        output,
+        theme,
+        [
+            "reach example.com".to_owned(),
+            "reach example.com 443".to_owned(),
+            "reach 192.0.2.10 22".to_owned(),
+            "reach fe80::1%12".to_owned(),
+        ],
+    );
 }
 
 const fn execution_explanation(kind: ExecutionErrorKind) -> &'static str {
@@ -305,7 +345,7 @@ const fn execution_actions(kind: ExecutionErrorKind) -> &'static [&'static str] 
         ],
         ExecutionErrorKind::InternalFailure => &[
             "Run the same command once more.",
-            "If it fails again, send this entire report and the command you used to the Reach maintainer or your support team.",
+            "If it fails again, send this result and the command you used to the Reach maintainer or your support team.",
         ],
     }
 }

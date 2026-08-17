@@ -53,6 +53,7 @@ and target support are release gates alongside functional suitability.
 | Adaptive terminal streams and style | `anstream` + `anstyle` | Rust CLI ecosystem primitives add color only when supported and strip ANSI automatically from redirected output. Reach owns only its semantic hierarchy and wording. |
 | Structured tables and width | `comfy-table` + `terminal_size` | Mature Unicode-aware table layout, content wrapping, and cross-platform terminal sizing replace handwritten column and border logic. |
 | Prose wrapping | `textwrap` | Mature Unicode-aware line breaking keeps explanations and actions readable at the detected terminal width. |
+| Display-width conformance | `unicode-width` | Mature Unicode display-width measurement verifies that adaptive layouts stay within the requested terminal width without first-party width tables. |
 | Transient progress | `indicatif` | Mature cross-platform TTY spinner and clearing behavior; redirected stderr remains empty. |
 | Duration presentation | `humantime` | Mature, deterministic human-readable formatting for observed durations and Attempt limits. |
 | Terminal-safe Unicode | `unicode-general-category` | Unicode category data identifies format controls such as bidirectional overrides without rejecting ordinary readable non-ASCII hostnames or OS text. |

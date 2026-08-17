@@ -36,10 +36,10 @@ fn redirected_help_is_plain_stdout_without_progress_or_ansi() {
 }
 
 #[test]
-fn version_reports_the_0_1_1_release() {
+fn version_reports_the_0_1_2_release() {
     let assertion = cargo_bin_cmd!("reach").arg("--version").assert().code(0);
     let output = assertion.get_output();
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "reach 0.1.1\n");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "reach 0.1.2\n");
     assert!(output.stderr.is_empty());
 }
 
@@ -57,10 +57,10 @@ fn ordinary_user_loopback_success_is_a_completed_stdout_result() {
     assert!(stdout.starts_with("✓ TCP CONNECTION SUCCEEDED\n"));
     assert!(stdout.contains(&format!("A TCP connection to 127.0.0.1:{port} succeeded")));
     assert!(stdout.contains("The TCP handshake completed"));
-    assert!(stdout.contains("Reach did not send application data"));
-    assert!(stdout.contains("NETWORK ATTEMPTS"));
-    assert!(stdout.contains("1 / A"));
-    assert!(stdout.contains("Exit code          0"));
+    assert!(stdout.contains("Reach sent no application data"));
+    assert!(!stdout.contains("EVIDENCE"));
+    assert!(!stdout.contains("TECHNICAL DETAILS"));
+    assert!(!stdout.contains("NETWORK ATTEMPTS"));
     assert!(!stdout.contains("formal target"));
     assert!(!stdout.contains('\u{1b}'));
     assert!(output.stderr.is_empty());
@@ -82,9 +82,10 @@ fn completed_network_failure_is_stdout_only_and_exit_one() {
     assert!(stdout.contains("TCP connection was explicitly refused"));
     assert!(stdout.contains("The refusal may come from the destination or an intermediate device"));
     assert!(stdout.contains("WHAT TO DO"));
-    assert!(stdout.contains("PATH AND NEIGHBOR FACTS"));
-    assert!(stdout.contains("NETWORK ATTEMPTS"));
-    assert!(stdout.contains("Exit code          1"));
+    assert!(stdout.contains("EVIDENCE"));
+    assert!(!stdout.contains("PATH AND NEIGHBOR FACTS"));
+    assert!(!stdout.contains("NETWORK ATTEMPTS"));
+    assert!(!stdout.contains("TECHNICAL DETAILS"));
     assert!(!stdout.contains('\u{1b}'));
     assert!(output.stderr.is_empty());
 }

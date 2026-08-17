@@ -26,9 +26,9 @@ pub use io::{
 pub use model::{
     AddressFamily, Attempt, AttemptId, AttemptKind, AttemptOutcome, AttemptSubject, AttemptTiming,
     DnsAttemptResult, DnsQueryType, FormalTarget, IcmpAttemptResult, IcmpMessageKind,
-    IcmpMessageObservation, InitialNetworkSnapshot, InterfaceAddress, InterfaceFact, InterfaceId,
-    InterfaceState, IpEndpoint, NeighborFact, NeighborIdentity, NeighborState,
-    OperationPathContext, PathRelation, PathSelectionFact, ResolverAddressSet,
+    IcmpMessageObservation, IcmpNativeStatus, InitialNetworkSnapshot, InterfaceAddress,
+    InterfaceFact, InterfaceId, InterfaceState, IpEndpoint, NeighborFact, NeighborIdentity,
+    NeighborState, OperationPathContext, PathRelation, PathSelectionFact, ResolverAddressSet,
     ResolverConfiguration, ResolverEndpoint, ResolverTransport, RouteBehavior, RouteFact,
     RoutingPolicyFacts, SnapshotInconsistency, SnapshotInconsistencyScope, SystemResolverFailure,
     SystemResolverFailureKind, SystemResolverObservation, SystemResolverResult, TargetIp,
@@ -46,6 +46,6 @@ pub use policy::{
 pub use result::{
     AggregateOutcome, Cancelled, CompletedDiagnostic, Conclusion, DiagnosticResult, Evidence,
     EvidenceFact, EvidenceId, EvidenceRole, EvidenceSubject, ExecutionError, ExecutionErrorKind,
-    ExitStatus, HostnameResolutionOutcome, PrimaryOutcome, ResolverDependencyDiagnostic,
-    TargetDiagnostic, TargetNetworkFacts, select_key_evidence,
+    ExitStatus, HostnameResolutionOutcome, NeighborObservation, PrimaryOutcome,
+    ResolverDependencyDiagnostic, TargetDiagnostic, TargetNetworkFacts, select_key_evidence,
 };

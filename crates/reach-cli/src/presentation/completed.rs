@@ -1,9 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt::Write as _,
-    net::IpAddr,
-    time::Duration,
-};
+use std::{fmt::Write as _, time::Duration};
 
 use comfy_table::{
     ContentArrangement, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_BORDERS_ONLY,
@@ -11,15 +6,12 @@ use comfy_table::{
 use humantime::format_duration;
 use reach_core::{
     AggregateOutcome, Attempt, AttemptId, AttemptKind, AttemptOutcome, CapabilityReason,
-    CapabilityValue, CompletedDiagnostic, Conclusion, DnsAttemptResult, DnsQueryType, Evidence,
-    EvidenceFact, EvidenceRole, HostnameResolutionOutcome, IcmpAttemptResult, IcmpMessageKind,
-    InitialPathAnalysis, InitialPathStatus, NeighborFact, NeighborState, OperationPathContext,
-    PathRelation, PrimaryOutcome, ResolverDependencyDiagnostic, ResolverTransport, RouteBehavior,
-    RouteFact, SystemResolverFailureKind, SystemResolverResult, TargetDiagnostic, TargetIp,
-    TargetNetworkFacts, TcpAttemptResult,
+    CompletedDiagnostic, Conclusion, DnsAttemptResult, DnsQueryType, Evidence, EvidenceFact,
+    HostnameResolutionOutcome, IcmpAttemptResult, IcmpMessageKind, NeighborObservation,
+    NeighborState, PrimaryOutcome, TargetDiagnostic, TargetIp, TcpAttemptResult,
 };
 
-use super::{Theme, bullets, field, indented_block, paragraph, section, terminal_escape};
+use super::{Theme, bullets, field, headline, paragraph, section, terminal_escape};
 
 pub(super) fn render(completed: &CompletedDiagnostic, theme: Theme) -> String {
     let mut output = String::new();
@@ -31,22 +23,20 @@ pub(super) fn render(completed: &CompletedDiagnostic, theme: Theme) -> String {
     render_meaning(&mut output, completed, theme);
     render_actions(&mut output, completed, theme);
     render_key_evidence(&mut output, completed, theme);
-    render_technical_details(&mut output, completed, theme);
     output
 }
 
 fn render_verdict(output: &mut String, completed: &CompletedDiagnostic, theme: Theme) {
     let title = verdict_title(completed);
-    let decorated = match completed.aggregate_outcome {
-        AggregateOutcome::AllSatisfied => theme.success(&format!("✓ {title}")),
-        AggregateOutcome::SatisfiedWithAnomaly | AggregateOutcome::Mixed => {
-            theme.warning(&format!("! {title}"))
-        }
+    let (marker, paint): (&str, fn(Theme, &str) -> String) = match completed.aggregate_outcome {
+        AggregateOutcome::AllSatisfied => ("✓", Theme::success),
+        AggregateOutcome::SatisfiedWithAnomaly | AggregateOutcome::Mixed => ("!", Theme::warning),
         AggregateOutcome::NoneCleanlySatisfied | AggregateOutcome::NoFormalTargets => {
-            theme.failure(&format!("× {title}"))
+            ("×", Theme::failure)
         }
     };
-    let _ = writeln!(output, "{decorated}");
+    let title_line = format!("{marker} {title}");
+    headline(output, theme, &title_line, paint);
     let _ = writeln!(output);
     for line in verdict_summary(completed) {
         paragraph(output, theme, &line);
@@ -58,40 +48,82 @@ fn render_check(output: &mut String, completed: &CompletedDiagnostic, theme: The
     section(output, theme, "CHECK");
     field(
         output,
+        theme,
         "Address",
         terminal_escape(&completed.request.original_address),
     );
     if let Some(port) = completed.request.port {
         field(
             output,
+            theme,
             "Test",
             format!("TCP connection to port {}", port.get()),
         );
     } else {
-        field(output, "Test", "ICMP Echo (address-level response)");
+        field(output, theme, "Test", "ICMP Echo");
     }
     if let Some(summary) = resolver_check_summary(completed) {
-        field(output, "System DNS", summary);
+        field(output, theme, "Name resolution", summary);
     }
-    field(output, "Result", count_summary(completed));
+    field(output, theme, "Result", result_summary(completed));
     let _ = writeln!(output);
 }
 
 fn render_targets(output: &mut String, completed: &CompletedDiagnostic, theme: Theme) {
     section(output, theme, "TARGETS");
-    let mut table = report_table(theme);
-    table.set_header(["Status", "Target", "Observed result"]);
-    for target in &completed.targets {
-        table.add_row([
-            target_status(target.primary_outcome).to_owned(),
-            target_label(
-                &target.target,
-                completed.request.port.map(|port| port.get()),
-            ),
-            target_observation(target),
-        ]);
+    if theme.content_width() < 60 {
+        for (index, target) in completed.targets.iter().enumerate() {
+            field(
+                output,
+                theme,
+                &format!("Target {}", index + 1),
+                target_label(
+                    &target.target,
+                    completed.request.port.map(|port| port.get()),
+                ),
+            );
+            field(
+                output,
+                theme,
+                "Status",
+                target_status(target.primary_outcome),
+            );
+            field(output, theme, "Observed result", target_observation(target));
+        }
+    } else {
+        let mut table = report_table(theme);
+        if theme.content_width() < 80 {
+            table.set_header(["Target", "Result"]);
+            for target in &completed.targets {
+                table.add_row([
+                    target_label(
+                        &target.target,
+                        completed.request.port.map(|port| port.get()),
+                    ),
+                    format!(
+                        "{} — {}",
+                        target_status(target.primary_outcome),
+                        target_observation(target)
+                    ),
+                ]);
+            }
+        } else {
+            table.set_header(["Status", "Target", "Observed result"]);
+            for target in &completed.targets {
+                table.add_row([
+                    target_status(target.primary_outcome).to_owned(),
+                    target_label(
+                        &target.target,
+                        completed.request.port.map(|port| port.get()),
+                    ),
+                    target_observation(target),
+                ]);
+            }
+        }
+        for line in table.to_string().lines() {
+            let _ = writeln!(output, "  {line}");
+        }
     }
-    indented_block(output, &table.to_string());
     let _ = writeln!(output);
 }
 
@@ -102,12 +134,12 @@ fn render_meaning(output: &mut String, completed: &CompletedDiagnostic, theme: T
 }
 
 fn render_actions(output: &mut String, completed: &CompletedDiagnostic, theme: Theme) {
-    let actions = actions(completed);
-    if actions.is_empty() {
+    let values = actions(completed);
+    if values.is_empty() {
         return;
     }
     section(output, theme, "WHAT TO DO");
-    bullets(output, theme, actions);
+    bullets(output, theme, values);
     let _ = writeln!(output);
 }
 
@@ -117,7 +149,7 @@ fn render_key_evidence(output: &mut String, completed: &CompletedDiagnostic, the
     {
         return;
     }
-    section(output, theme, "WHY REACH GAVE THIS RESULT");
+    section(output, theme, "EVIDENCE");
     bullets(
         output,
         theme,
@@ -129,486 +161,14 @@ fn render_key_evidence(output: &mut String, completed: &CompletedDiagnostic, the
     let _ = writeln!(output);
 }
 
-fn render_technical_details(output: &mut String, completed: &CompletedDiagnostic, theme: Theme) {
-    section(output, theme, "TECHNICAL DETAILS");
-    field(output, "Reach version", env!("CARGO_PKG_VERSION"));
-    field(
-        output,
-        "Platform",
-        format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
-    );
-    field(
-        output,
-        "Input",
-        request_label(
-            &completed.request.original_address,
-            completed.request.port.map(|port| port.get()),
-        ),
-    );
-    field(
-        output,
-        "Exit code",
-        completed.exit_status().code().to_string(),
-    );
-    let _ = writeln!(output);
-
-    render_system_resolver(output, completed, theme);
-    if !matches!(completed.aggregate_outcome, AggregateOutcome::AllSatisfied) {
-        render_snapshot(output, completed, theme);
-        render_path_details(output, completed, theme);
-        render_diagnostic_notes(output, completed, theme);
-    }
-    render_target_attempts(output, completed, theme);
-    render_additional_evidence(output, completed, theme);
-    for (index, resolver) in completed.resolver_diagnostics.iter().enumerate() {
-        render_resolver_details(output, resolver, index + 1, theme);
-    }
-}
-
-fn render_system_resolver(output: &mut String, completed: &CompletedDiagnostic, theme: Theme) {
-    let Some(resolver) = &completed.system_resolver else {
-        return;
-    };
-    let _ = writeln!(output, "  {}", theme.strong("SYSTEM DNS"));
-    field(
-        output,
-        "Duration",
-        human_duration(resolver.completed_at.saturating_sub(resolver.started_at)),
-    );
-    match &resolver.result {
-        SystemResolverResult::Succeeded(addresses) => {
-            field(output, "Outcome", "Succeeded");
-            field(
-                output,
-                "Returned",
-                counted(
-                    addresses.raw_addresses.len(),
-                    "address record",
-                    "address records",
-                ),
-            );
-            field(
-                output,
-                "Checked",
-                counted(
-                    addresses.formal_targets.len(),
-                    "unique address",
-                    "unique addresses",
-                ),
-            );
-            let values = addresses
-                .raw_addresses
-                .iter()
-                .enumerate()
-                .map(|(index, target)| format!("{}: {}", index + 1, target_label(target, None)))
-                .collect::<Vec<_>>();
-            field(
-                output,
-                "In order",
-                if values.is_empty() {
-                    "none".to_owned()
-                } else {
-                    values.join(", ")
-                },
-            );
-        }
-        SystemResolverResult::Failed(failure) => {
-            field(output, "Outcome", resolver_failure_label(failure.kind));
-            field(
-                output,
-                "OS code",
-                failure
-                    .platform_code
-                    .map_or_else(|| "not provided".to_owned(), |code| code.to_string()),
-            );
-            field(
-                output,
-                "OS message",
-                terminal_escape(&failure.platform_message),
-            );
-        }
-    }
-    let _ = writeln!(output);
-}
-
-fn render_snapshot(output: &mut String, completed: &CompletedDiagnostic, theme: Theme) {
-    let snapshot = &completed.initial_snapshot;
-    let _ = writeln!(output, "  {}", theme.strong("LOCAL NETWORK SNAPSHOT"));
-    field(
-        output,
-        "Capture duration",
-        human_duration(
-            snapshot
-                .capture_completed_at
-                .saturating_sub(snapshot.capture_started_at),
-        ),
-    );
-    field(
-        output,
-        "Interfaces",
-        capability_count(&snapshot.interfaces, "interface", "interfaces"),
-    );
-    field(
-        output,
-        "IPv4 routes",
-        capability_count(&snapshot.routes_v4, "route", "routes"),
-    );
-    field(
-        output,
-        "IPv6 routes",
-        capability_count(&snapshot.routes_v6, "route", "routes"),
-    );
-    field(
-        output,
-        "Route policy",
-        match &snapshot.routing_policy_facts {
-            CapabilityValue::Available { value, .. } => format!(
-                "available ({}; static selection complete={})",
-                counted(value.facts.len(), "fact", "facts"),
-                value.static_selection_complete
-            ),
-            CapabilityValue::Unknown { reason, .. } => {
-                format!("unknown ({})", capability_reason(reason))
-            }
-            CapabilityValue::Unavailable { reason, .. } => {
-                format!("unavailable ({})", capability_reason(reason))
-            }
-        },
-    );
-    field(
-        output,
-        "Resolver config",
-        match &snapshot.resolver_configuration {
-            CapabilityValue::Available { value, .. } => {
-                format!(
-                    "available ({})",
-                    counted(value.endpoints.len(), "endpoint", "endpoints")
-                )
-            }
-            CapabilityValue::Unknown { reason, .. } => {
-                format!("unknown ({})", capability_reason(reason))
-            }
-            CapabilityValue::Unavailable { reason, .. } => {
-                format!("unavailable ({})", capability_reason(reason))
-            }
-        },
-    );
-    if snapshot.inconsistencies.is_empty() {
-        field(output, "Consistency", "No snapshot change was detected");
-    } else {
-        for inconsistency in &snapshot.inconsistencies {
-            field(
-                output,
-                "Inconsistency",
-                format!(
-                    "{:?}: {}",
-                    inconsistency.scope,
-                    terminal_escape(&inconsistency.detail)
-                ),
-            );
-        }
-    }
-    let _ = writeln!(output);
-}
-
-fn render_path_details(output: &mut String, completed: &CompletedDiagnostic, theme: Theme) {
-    if completed.targets.is_empty() {
-        return;
-    }
-    let _ = writeln!(output, "  {}", theme.strong("PATH AND NEIGHBOR FACTS"));
-    let mut table = report_table(theme);
-    table.set_header(["Target", "Initial path", "Current path", "Neighbor"]);
-    for target in &completed.targets {
-        table.add_row([
-            target_label(
-                &target.target,
-                completed.request.port.map(|port| port.get()),
-            ),
-            initial_path_summary(&target.network_facts.initial_path),
-            current_path_summary(&target.network_facts.current_path),
-            neighbor_pair_summary(&target.network_facts),
-        ]);
-    }
-    indented_block(output, &table.to_string());
-    let mut limitations = BTreeMap::<String, Vec<String>>::new();
-    let mut comparisons = BTreeMap::<String, Vec<String>>::new();
-    let mut interface_identities = BTreeMap::<u32, BTreeSet<String>>::new();
-    for target in &completed.targets {
-        let label = target_label(
-            &target.target,
-            completed.request.port.map(|port| port.get()),
-        );
-        for route in &target.network_facts.initial_path.matching_routes {
-            field(
-                output,
-                "Matching route",
-                format!("{label}: {}", route_summary(route)),
-            );
-        }
-        for limitation in &target.network_facts.initial_path.limitations {
-            limitations
-                .entry(readable_detail(limitation))
-                .or_default()
-                .push(label.clone());
-        }
-        if let CapabilityValue::Available { value, .. } = &target.network_facts.current_path {
-            if let Some(comparison) = &value.relation_to_initial_snapshot {
-                comparisons
-                    .entry(terminal_escape(comparison))
-                    .or_default()
-                    .push(label.clone());
-            }
-            record_interface_identity(&mut interface_identities, value.egress_interface.as_ref());
-        }
-        for neighbor in [
-            target.network_facts.neighbor_pre_state.as_ref(),
-            target.network_facts.neighbor_post_state.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if let CapabilityValue::Available { value, .. } = neighbor {
-                record_interface_identity(
-                    &mut interface_identities,
-                    Some(&value.identity.interface),
-                );
-            }
-        }
-    }
-    for (limitation, targets) in limitations {
-        field(
-            output,
-            "Path limitation",
-            format!(
-                "{}: {limitation}",
-                grouped_targets(&targets, completed.targets.len())
-            ),
-        );
-    }
-    for (comparison, targets) in comparisons {
-        field(
-            output,
-            "Path comparison",
-            format!(
-                "{}: {comparison}",
-                grouped_targets(&targets, completed.targets.len())
-            ),
-        );
-    }
-    for (index, stable_ids) in interface_identities {
-        if !stable_ids.is_empty() {
-            field(
-                output,
-                "Interface identity",
-                format!(
-                    "index {index}: {}",
-                    stable_ids.into_iter().collect::<Vec<_>>().join(", ")
-                ),
-            );
-        }
-    }
-    let _ = writeln!(output);
-}
-
-fn render_diagnostic_notes(output: &mut String, completed: &CompletedDiagnostic, theme: Theme) {
-    if completed
-        .targets
-        .iter()
-        .all(|target| target.diagnostic_conclusions.is_empty())
-    {
-        return;
-    }
-    let _ = writeln!(output, "  {}", theme.strong("DIAGNOSTIC NOTES"));
-    for target in &completed.targets {
-        let label = target_label(
-            &target.target,
-            completed.request.port.map(|port| port.get()),
-        );
-        for conclusion in &target.diagnostic_conclusions {
-            field(
-                output,
-                "Target note",
-                format!("{label}: {}", diagnostic_note(conclusion)),
-            );
-        }
-    }
-    let _ = writeln!(output);
-}
-
-fn render_target_attempts(output: &mut String, completed: &CompletedDiagnostic, theme: Theme) {
-    let count = completed
-        .targets
-        .iter()
-        .map(|target| target.attempts.len())
-        .sum::<usize>();
-    if count == 0 {
-        return;
-    }
-    let _ = writeln!(output, "  {}", theme.strong("NETWORK ATTEMPTS"));
-    field(output, "Total", counted(count, "attempt", "attempts"));
-    let mut table = report_table(theme);
-    table.set_header([
-        "Target",
-        "# / ID",
-        "Check",
-        "Observed result",
-        "Elapsed / limit",
-    ]);
-    for target in &completed.targets {
-        let label = target_label(
-            &target.target,
-            completed.request.port.map(|port| port.get()),
-        );
-        for (index, attempt) in target.attempts.iter().enumerate() {
-            table.add_row([
-                label.clone(),
-                format!("{} / A{}", index + 1, attempt.id.0),
-                attempt_kind_label(attempt.kind),
-                attempt_outcome_label(&attempt.outcome),
-                format!(
-                    "{} / {}",
-                    human_duration(attempt.timing.duration()),
-                    human_duration(
-                        attempt
-                            .timing
-                            .deadline_at
-                            .saturating_sub(attempt.timing.started_at)
-                    )
-                ),
-            ]);
-        }
-    }
-    indented_block(output, &table.to_string());
-    let _ = writeln!(output);
-}
-
-fn render_additional_evidence(output: &mut String, completed: &CompletedDiagnostic, theme: Theme) {
-    let values = completed
-        .targets
-        .iter()
-        .flat_map(|target| {
-            let label = target_label(
-                &target.target,
-                completed.request.port.map(|port| port.get()),
-            );
-            target.evidence.iter().filter_map(move |evidence| {
-                additional_evidence(&evidence.fact)
-                    .map(|fact| format!("{label}: {}: {fact}", evidence_role_label(evidence.role)))
-            })
-        })
-        .collect::<Vec<_>>();
-    if values.is_empty() {
-        return;
-    }
-    let _ = writeln!(output, "  {}", theme.strong("ADDITIONAL EVIDENCE"));
-    for value in values {
-        field(output, "Evidence", value);
-    }
-    let _ = writeln!(output);
-}
-
-fn render_resolver_details(
-    output: &mut String,
-    resolver: &ResolverDependencyDiagnostic,
-    ordinal: usize,
-    theme: Theme,
-) {
-    let endpoint = format!(
-        "{}:{} via {}",
-        resolver.endpoint.address,
-        resolver.endpoint.port,
-        resolver_transport_label(resolver.endpoint.transport)
-    );
-    let _ = writeln!(
-        output,
-        "  {}",
-        theme.strong(&format!("DNS DIAGNOSTIC {ordinal} — {endpoint}"))
-    );
-    render_network_facts(output, &resolver.network_facts);
-    render_attempts(output, &resolver.attempts, theme);
-    render_non_attempt_evidence(output, &resolver.evidence);
-    let _ = writeln!(output);
-}
-
-fn render_network_facts(output: &mut String, facts: &TargetNetworkFacts) {
-    field(
-        output,
-        "Initial path",
-        initial_path_summary(&facts.initial_path),
-    );
-    for route in &facts.initial_path.matching_routes {
-        field(output, "Matching route", route_summary(route));
-    }
-    for limitation in &facts.initial_path.limitations {
-        field(output, "Path limit", readable_detail(limitation));
-    }
-    field(
-        output,
-        "Current path",
-        current_path_summary(&facts.current_path),
-    );
-    if let Some(before) = &facts.neighbor_pre_state {
-        field(output, "Neighbor before", neighbor_summary(before));
-    }
-    if let Some(after) = &facts.neighbor_post_state {
-        field(output, "Neighbor after", neighbor_summary(after));
-    }
-}
-
-fn render_attempts(output: &mut String, attempts: &[Attempt], theme: Theme) {
-    if attempts.is_empty() {
-        field(output, "Attempts", "No active network attempt was needed");
-        return;
-    }
-    let mut table = report_table(theme);
-    table.set_header(["#", "Check", "Observed result", "Timing"]);
-    for (index, attempt) in attempts.iter().enumerate() {
-        table.add_row([
-            format!("{} (A{})", index + 1, attempt.id.0),
-            attempt_kind_label(attempt.kind),
-            attempt_outcome_label(&attempt.outcome),
-            format!(
-                "{} / {}",
-                human_duration(attempt.timing.duration()),
-                human_duration(
-                    attempt
-                        .timing
-                        .deadline_at
-                        .saturating_sub(attempt.timing.started_at)
-                )
-            ),
-        ]);
-    }
-    field(output, "Attempts", format!("{} total", attempts.len()));
-    indented_block(output, &table.to_string());
-}
-
-fn render_non_attempt_evidence(output: &mut String, evidence: &[Evidence]) {
-    for item in evidence {
-        if matches!(item.fact, EvidenceFact::Attempt(_)) {
-            continue;
-        }
-        field(
-            output,
-            "Evidence",
-            format!(
-                "{}: {}",
-                evidence_role_label(item.role),
-                evidence_fact_label(&item.fact)
-            ),
-        );
-    }
-}
-
 fn report_table(theme: Theme) -> Table {
     let mut table = Table::new();
     table
         .load_preset(UTF8_BORDERS_ONLY)
         .apply_modifier(UTF8_ROUND_CORNERS)
         .set_content_arrangement(ContentArrangement::Dynamic);
-    if let Some(width) = theme.table_width() {
-        table.set_width(width);
-    }
+    let available = theme.content_width().saturating_sub(2).max(1);
+    table.set_width(u16::try_from(available).unwrap_or(u16::MAX));
     table
 }
 
@@ -674,10 +234,14 @@ fn verdict_summary(completed: &CompletedDiagnostic) -> Vec<String> {
                 }]
             }
         }
-        AggregateOutcome::SatisfiedWithAnomaly => vec![format!(
-            "All {} eventually responded, but at least one first timed out and succeeded only on retry.",
-            counted(count, "IP address", "IP addresses")
-        )],
+        AggregateOutcome::SatisfiedWithAnomaly => vec![if count == 1 {
+            "The destination eventually responded, but its first attempt timed out and a retry was needed."
+                .to_owned()
+        } else {
+            format!(
+                "All {count} IP addresses eventually responded, but at least one first timed out and required a retry."
+            )
+        }],
         AggregateOutcome::Mixed => {
             let clean = completed
                 .targets
@@ -696,26 +260,47 @@ fn verdict_summary(completed: &CompletedDiagnostic) -> Vec<String> {
         AggregateOutcome::NoneCleanlySatisfied => {
             if let Some(port) = completed.request.port {
                 if all_targets_are(completed, Conclusion::TcpTimedOutButTargetIcmpResponded) {
-                    vec![
-                        format!(
-                            "TCP connections to port {} timed out for all {}.",
-                            port.get(),
-                            counted(count, "IP address", "IP addresses")
-                        ),
-                        "The same IP addresses replied to ICMP Echo even though the TCP connections did not complete."
-                            .to_owned(),
-                    ]
+                    if count == 1 {
+                        vec![
+                            format!(
+                                "Two TCP connection attempts to {} timed out.",
+                                target_label(&completed.targets[0].target, Some(port.get()))
+                            ),
+                            "That IP address replied to ICMP Echo.".to_owned(),
+                        ]
+                    } else {
+                        vec![
+                            format!(
+                                "TCP connection attempts to port {} timed out twice for all {count} IP addresses.",
+                                port.get()
+                            ),
+                            "Those IP addresses replied to ICMP Echo.".to_owned(),
+                        ]
+                    }
                 } else if all_targets_are(completed, Conclusion::TcpConnectionRefused) {
-                    vec![format!(
-                        "Every IP address explicitly refused the TCP connection to port {}.",
-                        port.get()
-                    )]
+                    vec![if count == 1 {
+                        format!(
+                            "The TCP connection to {} was explicitly refused.",
+                            target_label(&completed.targets[0].target, Some(port.get()))
+                        )
+                    } else {
+                        format!(
+                            "All {count} IP addresses explicitly refused the TCP connection to port {}.",
+                            port.get()
+                        )
+                    }]
                 } else {
-                    vec![format!(
-                        "No TCP connection to port {} completed successfully for the {} checked.",
-                        port.get(),
-                        counted(count, "IP address", "IP addresses")
-                    )]
+                    vec![if count == 1 {
+                        format!(
+                            "The TCP connection to {} did not succeed.",
+                            target_label(&completed.targets[0].target, Some(port.get()))
+                        )
+                    } else {
+                        format!(
+                            "No TCP connection to port {} succeeded for the {count} IP addresses checked.",
+                            port.get()
+                        )
+                    }]
                 }
             } else {
                 vec![if count == 1 {
@@ -729,13 +314,13 @@ fn verdict_summary(completed: &CompletedDiagnostic) -> Vec<String> {
         }
         AggregateOutcome::NoFormalTargets => match &completed.hostname_resolution {
             HostnameResolutionOutcome::DefinitiveNegative { .. } => vec![format!(
-                "The system DNS resolver reported that {address} does not exist."
+                "System name resolution reported that {address} does not exist."
             )],
             HostnameResolutionOutcome::NonDefinitiveFailure { .. } => vec![format!(
-                "The system DNS resolver could not produce a reliable IP address for {address}."
+                "System name resolution could not produce a reliable IP address for {address}."
             )],
             HostnameResolutionOutcome::SucceededWithoutUsableAddress => vec![format!(
-                "The system DNS resolver completed but returned no usable IPv4 or IPv6 address for {address}."
+                "System name resolution completed but returned no usable IPv4 or IPv6 address for {address}."
             )],
             HostnameResolutionOutcome::NotRequested | HostnameResolutionOutcome::Succeeded(_) => {
                 vec![
@@ -751,28 +336,27 @@ fn meaning(completed: &CompletedDiagnostic) -> Vec<String> {
         AggregateOutcome::AllSatisfied => {
             if completed.request.port.is_some() {
                 vec![
-                    "The TCP handshake completed. This confirms TCP connectivity to the requested port at the time of the check."
+                    "The TCP handshake completed, confirming TCP connectivity to the requested port at the time of the check."
                         .to_owned(),
-                    "Reach did not send application data, so this does not prove that HTTP, HTTPS, SSH, or another application protocol is working."
+                    "Reach sent no application data, so this does not prove that HTTP, HTTPS, SSH, or another application protocol is working."
                         .to_owned(),
                 ]
             } else {
                 vec![
                     "The destination returned an ICMP Echo Reply, confirming an address-level response at the time of the check."
                         .to_owned(),
-                    "This does not test a TCP port, website, or other application service."
-                        .to_owned(),
+                    "This does not test a TCP port, website, or application service.".to_owned(),
                 ]
             }
         }
         AggregateOutcome::SatisfiedWithAnomaly => vec![
-            "Connectivity was eventually observed, but the earlier timeout is real evidence of a transient or intermittent problem."
+            "Connectivity was eventually observed, but the earlier timeout remains evidence of an intermittent result."
                 .to_owned(),
             "The later success does not erase the first timeout, so Reach does not report a clean pass."
                 .to_owned(),
         ],
         AggregateOutcome::Mixed => vec![
-            "A hostname can lead to several IP addresses. Some paths or destination instances responded differently from others."
+            "A hostname can lead to several IP addresses, and those destinations can respond differently."
                 .to_owned(),
             "A successful address does not erase a failure or uncertainty on another address."
                 .to_owned(),
@@ -782,10 +366,16 @@ fn meaning(completed: &CompletedDiagnostic) -> Vec<String> {
                 completed,
                 Conclusion::TcpTimedOutButTargetIcmpResponded,
             ) {
+                let subject = if completed.targets.len() == 1 {
+                    "The destination IP responded to ICMP"
+                } else {
+                    "The destination IP addresses responded to ICMP"
+                };
                 vec![
-                    "The IP addresses exchanged ICMP traffic with this computer, but no TCP connection to the requested port completed."
-                        .to_owned(),
-                    "A timeout does not prove that the port is closed and does not identify whether filtering, the network path, or the destination service caused the missing TCP response."
+                    format!(
+                        "{subject}, but no TCP connection to the requested port completed."
+                    ),
+                    "This does not prove that the port is closed. Reach cannot determine from these observations alone whether filtering, the network path, or the destination service caused the missing TCP response."
                         .to_owned(),
                 ]
             } else if all_targets_are(completed, Conclusion::TcpConnectionRefused) {
@@ -797,24 +387,22 @@ fn meaning(completed: &CompletedDiagnostic) -> Vec<String> {
                 ]
             } else if completed.request.port.is_some() {
                 vec![
-                    "The requested TCP connection did not complete. The per-target observations and technical details show the exact failure boundary Reach observed."
+                    "The requested TCP connection did not succeed; the destination results and evidence below show the boundary Reach actually observed."
                         .to_owned(),
-                    "Reach does not guess an unobserved root cause from a timeout or operating-system error name."
+                    "Reach does not guess an unobserved root cause from a timeout or an operating-system error name."
                         .to_owned(),
                 ]
             } else {
                 vec![
-                    "Reach did not obtain a confirmed ICMP Echo response. This alone does not prove that the destination is down because ICMP may be blocked or limited."
-                        .to_owned(),
-                    "The technical details retain any route, Neighbor, first-hop, and capability evidence that could narrow the boundary safely."
+                    "Reach did not obtain a confirmed ICMP Echo Reply. This alone does not prove that the destination is down because ICMP may be blocked or limited."
                         .to_owned(),
                 ]
             }
         }
         AggregateOutcome::NoFormalTargets => vec![
-            "No destination connection or ICMP check was started because Reach did not have a usable IP address from the system resolver."
+            "No destination connection or ICMP check was started because system name resolution did not provide a usable IP address."
                 .to_owned(),
-            "Any direct DNS checks shown below are diagnostic evidence only and were not promoted into destination addresses."
+            "Any direct DNS evidence below is failure diagnosis only and was not used as a destination address."
                 .to_owned(),
         ],
     }
@@ -825,13 +413,13 @@ fn actions(completed: &CompletedDiagnostic) -> Vec<String> {
         AggregateOutcome::AllSatisfied => Vec::new(),
         AggregateOutcome::SatisfiedWithAnomaly => vec![
             "Run the same check again and note whether the timeout repeats.".to_owned(),
-            "If users notice intermittent failures, send this entire report to the service owner or network team."
+            "If users notice intermittent failures, send this result to the service owner or network team."
                 .to_owned(),
         ],
         AggregateOutcome::Mixed => vec![
-            "Send this entire report to the service owner or network team; the per-address difference is important."
+            "Send this result to the service owner or network team; the per-address difference is important."
                 .to_owned(),
-            "Do not remove the addresses that failed when sharing the result.".to_owned(),
+            "Keep every address and result when sharing it.".to_owned(),
         ],
         AggregateOutcome::NoneCleanlySatisfied => {
             if let Some(port) = completed.request.port {
@@ -840,21 +428,21 @@ fn actions(completed: &CompletedDiagnostic) -> Vec<String> {
                         "Verify that TCP port {} is correct and that the service is expected to accept connections on it.",
                         port.get()
                     ),
-                    "If the port should be reachable, send this entire report to the service owner or network team."
+                    "If the port should be reachable, send this result to the service owner or network team."
                         .to_owned(),
                 ]
             } else {
                 vec![
-                    "If the destination is expected to answer ping, run the check again to rule out a short transient loss."
+                    "If the destination is expected to answer ping, run the check again to rule out short packet loss."
                         .to_owned(),
-                    "If you need help, send this entire report to the network team; ICMP silence alone is not proof that the destination is down."
+                    "If you need help, send this result to the network team; ICMP silence alone is not proof that the destination is down."
                         .to_owned(),
                 ]
             }
         }
         AggregateOutcome::NoFormalTargets => vec![
             "Check the spelling of the hostname and try again.".to_owned(),
-            "If the name is correct, send this entire report to the support or network team so they can inspect the DNS details."
+            "If the name is correct, send this result to the support or network team."
                 .to_owned(),
         ],
     }
@@ -865,7 +453,11 @@ fn resolver_check_summary(completed: &CompletedDiagnostic) -> Option<String> {
         HostnameResolutionOutcome::NotRequested => None,
         HostnameResolutionOutcome::Succeeded(addresses) => Some(format!(
             "{}, {} checked",
-            counted(addresses.raw_addresses.len(), "record", "records"),
+            counted(
+                addresses.raw_addresses.len(),
+                "address returned",
+                "addresses returned"
+            ),
             counted(
                 addresses.formal_targets.len(),
                 "unique address",
@@ -884,10 +476,35 @@ fn resolver_check_summary(completed: &CompletedDiagnostic) -> Option<String> {
     }
 }
 
-fn count_summary(completed: &CompletedDiagnostic) -> String {
-    if completed.targets.is_empty() {
-        return "No IP address was checked".to_owned();
+fn result_summary(completed: &CompletedDiagnostic) -> String {
+    match completed.aggregate_outcome {
+        AggregateOutcome::AllSatisfied => "Passed".to_owned(),
+        AggregateOutcome::SatisfiedWithAnomaly => {
+            "Passed after retry; earlier timeout retained".to_owned()
+        }
+        AggregateOutcome::Mixed => count_summary(completed),
+        AggregateOutcome::NoneCleanlySatisfied => {
+            let failed = completed
+                .targets
+                .iter()
+                .filter(|target| target.primary_outcome == PrimaryOutcome::NotSatisfied)
+                .count();
+            let inconclusive = completed
+                .targets
+                .iter()
+                .filter(|target| target.primary_outcome == PrimaryOutcome::Indeterminate)
+                .count();
+            match (failed, inconclusive) {
+                (0, _) => "Inconclusive".to_owned(),
+                (_, 0) => "Failed".to_owned(),
+                _ => format!("{failed} failed, {inconclusive} inconclusive"),
+            }
+        }
+        AggregateOutcome::NoFormalTargets => "No IP address checked".to_owned(),
     }
+}
+
+fn count_summary(completed: &CompletedDiagnostic) -> String {
     let clean = completed
         .targets
         .iter()
@@ -929,19 +546,12 @@ fn target_observation(target: &TargetDiagnostic) -> String {
             "TCP connection succeeded on retry after an earlier timeout".to_owned()
         }
         Conclusion::TcpConnectionRefused => "TCP connection was explicitly refused".to_owned(),
-        Conclusion::TcpExplicitFailure => target
-            .attempts
-            .iter()
-            .find_map(|attempt| match &attempt.outcome {
-                AttemptOutcome::Tcp(result) if !matches!(result, TcpAttemptResult::Timeout) => {
-                    Some(attempt_outcome_label(&attempt.outcome))
-                }
-                _ => None,
-            })
-            .unwrap_or_else(|| "TCP connection failed with an explicit error".to_owned()),
+        Conclusion::TcpExplicitFailure => {
+            "TCP connection failed with an explicit network result".to_owned()
+        }
         Conclusion::TcpConnectTimedOut => "TCP connection timed out twice".to_owned(),
         Conclusion::TcpTimedOutButTargetIcmpResponded => {
-            "TCP timed out twice; the IP address replied to ICMP Echo".to_owned()
+            "TCP timed out twice; ICMP Echo replied".to_owned()
         }
         Conclusion::TcpTimedOutWithExplicitIcmpResult => {
             "TCP timed out twice; ICMP returned an explicit network result".to_owned()
@@ -950,22 +560,13 @@ fn target_observation(target: &TargetDiagnostic) -> String {
         Conclusion::IcmpEchoRepliedAfterTimeout => {
             "ICMP Echo Reply received on retry after an earlier timeout".to_owned()
         }
-        Conclusion::IcmpExplicitFailure => target
-            .attempts
-            .iter()
-            .find_map(|attempt| match &attempt.outcome {
-                AttemptOutcome::Icmp(result) if !matches!(result, IcmpAttemptResult::Timeout) => {
-                    Some(attempt_outcome_label(&attempt.outcome))
-                }
-                _ => None,
-            })
-            .unwrap_or_else(|| "ICMP returned an explicit network result".to_owned()),
+        Conclusion::IcmpExplicitFailure => "ICMP returned an explicit network result".to_owned(),
         Conclusion::IcmpEchoTimedOut => "No ICMP Echo Reply after two attempts".to_owned(),
         Conclusion::IcmpResponseIndeterminate => {
             "ICMP response did not prove success or a definite failure".to_owned()
         }
         Conclusion::DefinitiveNoPath => {
-            "Local network information proves there is no usable path".to_owned()
+            "Local network facts prove there is no usable path".to_owned()
         }
         Conclusion::NeighborResolutionFailed => {
             "Required local Neighbor resolution failed".to_owned()
@@ -998,7 +599,7 @@ fn diagnostic_note(conclusion: &Conclusion) -> &'static str {
             "TCP connection succeeded only after an earlier timeout"
         }
         Conclusion::TcpConnectionRefused => "TCP connection was explicitly refused",
-        Conclusion::TcpExplicitFailure => "TCP connection failed with an explicit error",
+        Conclusion::TcpExplicitFailure => "TCP connection failed with an explicit result",
         Conclusion::TcpConnectTimedOut => "TCP connection timed out twice",
         Conclusion::TcpTimedOutButTargetIcmpResponded => {
             "TCP timed out, but the target IP replied to ICMP Echo"
@@ -1013,12 +614,12 @@ fn diagnostic_note(conclusion: &Conclusion) -> &'static str {
         Conclusion::IcmpExplicitFailure => "ICMP returned an explicit failure result",
         Conclusion::IcmpEchoTimedOut => "ICMP Echo timed out twice",
         Conclusion::IcmpResponseIndeterminate => "ICMP response remained inconclusive",
-        Conclusion::DefinitiveNoPath => "Initial local facts prove no usable path",
+        Conclusion::DefinitiveNoPath => "Snapshot path inference proved no usable path",
         Conclusion::NeighborResolutionFailed => "Required local Neighbor resolution failed",
         Conclusion::NeighborResolutionIndeterminate => {
             "Required local Neighbor resolution remained inconclusive"
         }
-        Conclusion::FirstHopResponded => "The current first hop replied directly",
+        Conclusion::FirstHopResponded => "The targeted first hop replied directly",
         Conclusion::MultiplePathRespondersObserved => {
             "More than one responder was observed at the same path hop"
         }
@@ -1034,13 +635,15 @@ fn diagnostic_note(conclusion: &Conclusion) -> &'static str {
         Conclusion::PathLimitReachedWithoutEndpointEvidence => {
             "Path diagnosis reached its hop limit without endpoint evidence"
         }
-        Conclusion::HostnameResolved => "System DNS produced destination addresses",
-        Conclusion::HostnameNoFormalTargets => "System DNS produced no usable destination address",
+        Conclusion::HostnameResolved => "System name resolution produced destination addresses",
+        Conclusion::HostnameNoFormalTargets => {
+            "System name resolution produced no usable destination address"
+        }
         Conclusion::HostnameResolutionDefinitiveNegative => {
-            "System DNS reported that the hostname does not exist"
+            "System name resolution reported that the hostname does not exist"
         }
         Conclusion::HostnameResolutionIndeterminate => {
-            "System DNS failed without a definitive answer"
+            "System name resolution failed without a definitive answer"
         }
         Conclusion::AllTargetsSatisfied => "Every address passed cleanly",
         Conclusion::TargetsSatisfiedWithAnomaly => {
@@ -1057,78 +660,63 @@ fn diagnostic_note(conclusion: &Conclusion) -> &'static str {
 fn evidence_summary(completed: &CompletedDiagnostic, evidence: &Evidence) -> String {
     match &evidence.fact {
         EvidenceFact::Attempt(id) => find_attempt(completed, *id).map_or_else(
-            || format!("Attempt A{} was retained as decision evidence.", id.0),
-            |(attempt, ordinal)| {
-                format!(
-                    "{} attempt {ordinal} (A{}): {} in {}.",
-                    attempt_kind_label(attempt.kind),
-                    attempt.id.0,
-                    friendly_attempt_outcome(&attempt.outcome),
-                    human_duration(attempt.timing.duration())
-                )
-            },
+            || "A decision attempt was retained, but its detail is unavailable.".to_owned(),
+            |(attempt, ordinal)| attempt_evidence_summary(attempt, ordinal),
         ),
-        EvidenceFact::SystemResolverResult(_) => resolver_check_summary(completed).map_or_else(
-            || "System DNS completed.".to_owned(),
-            |summary| format!("System DNS: {summary}."),
-        ),
-        fact => as_sentence(evidence_fact_label(fact)),
-    }
-}
-
-fn additional_evidence(fact: &EvidenceFact) -> Option<String> {
-    match fact {
-        EvidenceFact::Attempt(_)
-        | EvidenceFact::InitialPath(_)
-        | EvidenceFact::CurrentPath(_)
-        | EvidenceFact::NeighborTransition { .. }
-        | EvidenceFact::SystemResolverResult(_) => None,
-        EvidenceFact::DirectDnsResult(_)
-        | EvidenceFact::CapabilityUnavailable { .. }
-        | EvidenceFact::SnapshotInconsistency(_)
-        | EvidenceFact::SocketPathComparison(_) => Some(evidence_fact_label(fact)),
-    }
-}
-
-fn as_sentence(mut value: String) -> String {
-    if !value.ends_with(['.', '!', '?']) {
-        value.push('.');
-    }
-    value
-}
-
-fn evidence_fact_label(fact: &EvidenceFact) -> String {
-    match fact {
-        EvidenceFact::Attempt(id) => format!("Attempt A{}", id.0),
         EvidenceFact::InitialPath(value) => {
-            format!("Initial path: {}", terminal_escape(value))
+            format!("Snapshot path inference: {}.", terminal_escape(value))
         }
         EvidenceFact::CurrentPath(value) => {
-            format!("Current path: {}", terminal_escape(value))
+            format!("Targeted OS path query: {}.", terminal_escape(value))
         }
         EvidenceFact::NeighborTransition { before, after } => format!(
-            "Neighbor state changed from {} to {}",
-            before.map_or("not observed", neighbor_state_label),
+            "Neighbor before: {}; after: {}.",
+            neighbor_observation_label(*before),
             neighbor_state_label(*after)
         ),
-        EvidenceFact::SystemResolverResult(value) => {
-            format!("System DNS: {}", terminal_escape(value))
-        }
+        EvidenceFact::SystemResolverResult(_) => resolver_check_summary(completed).map_or_else(
+            || "System name resolution completed.".to_owned(),
+            |summary| format!("Name resolution: {summary}."),
+        ),
         EvidenceFact::DirectDnsResult(value) => {
-            format!("Direct DNS diagnostic: {}", terminal_escape(value))
+            format!("Direct DNS diagnostic: {}.", terminal_escape(value))
         }
         EvidenceFact::CapabilityUnavailable { capability, reason } => format!(
-            "{} unavailable: {}",
+            "{} unavailable: {}.",
             terminal_escape(capability),
             capability_reason(reason)
         ),
-        EvidenceFact::SnapshotInconsistency(value) => {
-            format!("Network snapshot changed: {}", terminal_escape(value))
-        }
+        EvidenceFact::SnapshotInconsistency(value) => format!(
+            "Snapshot cross-check found an inconsistency: {}.",
+            terminal_escape(value)
+        ),
         EvidenceFact::SocketPathComparison(value) => {
-            format!("Socket/path comparison: {}", terminal_escape(value))
+            format!("Targeted OS path comparison: {}.", terminal_escape(value))
         }
     }
+}
+
+fn attempt_evidence_summary(attempt: &Attempt, ordinal: usize) -> String {
+    let check = attempt_kind_label(attempt.kind);
+    let budget = attempt
+        .timing
+        .deadline_at
+        .saturating_sub(attempt.timing.started_at);
+    if attempt_timed_out(&attempt.outcome) {
+        return format!(
+            "{check} #{ordinal}: No result before the {} deadline.",
+            human_duration(budget)
+        );
+    }
+    let timing = if attempt.timing.duration().is_zero() {
+        " at the same observable clock reading".to_owned()
+    } else {
+        format!(" in {}", human_duration(attempt.timing.duration()))
+    };
+    format!(
+        "{check} #{ordinal}: {}{timing}.",
+        friendly_attempt_outcome(&attempt.outcome)
+    )
 }
 
 fn find_attempt(completed: &CompletedDiagnostic, id: AttemptId) -> Option<(&Attempt, usize)> {
@@ -1157,30 +745,31 @@ fn find_attempt(completed: &CompletedDiagnostic, id: AttemptId) -> Option<(&Atte
 
 fn attempt_kind_label(kind: AttemptKind) -> String {
     match kind {
-        AttemptKind::TcpConnect => "TCP Connect".to_owned(),
-        AttemptKind::TargetIcmpEcho => "Target ICMP Echo".to_owned(),
+        AttemptKind::TcpConnect => "TCP connect".to_owned(),
+        AttemptKind::TargetIcmpEcho => "ICMP Echo".to_owned(),
         AttemptKind::NextHopIcmpEcho => "Next-hop ICMP Echo".to_owned(),
         AttemptKind::TcpPath { hop_limit } => {
-            format!("TCP path probe (hop limit {hop_limit})")
+            format!("TCP path check at hop limit {hop_limit}")
         }
         AttemptKind::IcmpPath { hop_limit } => {
-            format!("ICMP path probe (hop limit {hop_limit})")
+            format!("ICMP path check at hop limit {hop_limit}")
         }
         AttemptKind::DnsUdp { query_type } => {
-            format!("DNS {} over UDP", dns_query_type_label(query_type))
+            format!("Direct DNS {} over UDP", dns_query_type_label(query_type))
         }
         AttemptKind::DnsTcp { query_type } => {
-            format!("DNS {} over TCP", dns_query_type_label(query_type))
+            format!("Direct DNS {} over TCP", dns_query_type_label(query_type))
         }
     }
 }
 
-fn attempt_outcome_label(outcome: &AttemptOutcome) -> String {
-    match outcome {
-        AttemptOutcome::Tcp(result) => tcp_outcome_label(result),
-        AttemptOutcome::Icmp(result) => icmp_outcome_label(result),
-        AttemptOutcome::Dns(result) => dns_outcome_label(result),
-    }
+fn attempt_timed_out(outcome: &AttemptOutcome) -> bool {
+    matches!(
+        outcome,
+        AttemptOutcome::Tcp(TcpAttemptResult::Timeout)
+            | AttemptOutcome::Icmp(IcmpAttemptResult::Timeout)
+            | AttemptOutcome::Dns(DnsAttemptResult::Timeout)
+    )
 }
 
 fn friendly_attempt_outcome(outcome: &AttemptOutcome) -> String {
@@ -1201,11 +790,11 @@ fn friendly_attempt_outcome(outcome: &AttemptOutcome) -> String {
             .collect::<Vec<_>>()
             .join("; "),
         AttemptOutcome::Icmp(IcmpAttemptResult::ExplicitNetworkError { os_code }) => format!(
-            "explicit operating-system network error (code {})",
-            os_code.map_or_else(|| "not provided".to_owned(), |code| code.to_string())
+            "explicit operating-system network error{}",
+            os_code.map_or_else(String::new, |code| format!(" (code {code})"))
         ),
         AttemptOutcome::Icmp(IcmpAttemptResult::Timeout) => {
-            "timed out with no ICMP response".to_owned()
+            "no ICMP response before the deadline".to_owned()
         }
         AttemptOutcome::Dns(result) => dns_outcome_label(result),
     }
@@ -1213,75 +802,26 @@ fn friendly_attempt_outcome(outcome: &AttemptOutcome) -> String {
 
 fn tcp_outcome_label(result: &TcpAttemptResult) -> String {
     match result {
-        TcpAttemptResult::Connected { local, remote } => format!(
-            "Connected (local {}; remote {})",
-            endpoint_capability(local),
-            endpoint_capability(remote)
-        ),
-        TcpAttemptResult::ConnectionRefused => "Connection refused".to_owned(),
-        TcpAttemptResult::NoRoute => "No route".to_owned(),
-        TcpAttemptResult::NetworkUnreachable => "Network unreachable".to_owned(),
-        TcpAttemptResult::HostUnreachable => "Host unreachable".to_owned(),
-        TcpAttemptResult::PermissionDenied => "Permission denied".to_owned(),
-        TcpAttemptResult::ResourceExhausted => "Local resources exhausted".to_owned(),
+        TcpAttemptResult::Connected { .. } => "TCP connection succeeded".to_owned(),
+        TcpAttemptResult::ConnectionRefused => "TCP connection was refused".to_owned(),
+        TcpAttemptResult::NoRoute => "the operating system reported no route".to_owned(),
+        TcpAttemptResult::NetworkUnreachable => {
+            "the operating system reported the network unreachable".to_owned()
+        }
+        TcpAttemptResult::HostUnreachable => {
+            "the operating system reported the host unreachable".to_owned()
+        }
+        TcpAttemptResult::PermissionDenied => {
+            "the operating system denied the connection attempt".to_owned()
+        }
+        TcpAttemptResult::ResourceExhausted => {
+            "local networking resources were exhausted".to_owned()
+        }
         TcpAttemptResult::OtherExplicitError { os_code } => format!(
-            "Explicit operating-system error (code {})",
-            os_code.map_or_else(|| "not provided".to_owned(), |code| code.to_string())
+            "explicit operating-system error{}",
+            os_code.map_or_else(String::new, |code| format!(" (code {code})"))
         ),
-        TcpAttemptResult::Timeout => "Timed out with no explicit result".to_owned(),
-    }
-}
-
-fn endpoint_capability(value: &CapabilityValue<reach_core::IpEndpoint>) -> String {
-    match value {
-        CapabilityValue::Available { value, .. } => {
-            if value.address.is_ipv6() {
-                format!("[{}]:{}", value.address, value.port)
-            } else {
-                format!("{}:{}", value.address, value.port)
-            }
-        }
-        CapabilityValue::Unknown { reason, .. } => {
-            format!("unknown: {}", capability_reason(reason))
-        }
-        CapabilityValue::Unavailable { reason, .. } => {
-            format!("unavailable: {}", capability_reason(reason))
-        }
-    }
-}
-
-fn icmp_outcome_label(result: &IcmpAttemptResult) -> String {
-    match result {
-        IcmpAttemptResult::Message {
-            kind,
-            responder,
-            raw_type,
-            raw_code,
-        } => format!(
-            "{} from {} (raw type {}, raw code {})",
-            icmp_kind_label(*kind),
-            responder,
-            raw_icmp_value(*raw_type),
-            optional_number(*raw_code)
-        ),
-        IcmpAttemptResult::Messages(messages) => messages
-            .iter()
-            .map(|message| {
-                format!(
-                    "{} from {} (raw type {}, raw code {})",
-                    icmp_kind_label(message.kind),
-                    message.responder,
-                    raw_icmp_value(message.raw_type),
-                    optional_number(message.raw_code)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; "),
-        IcmpAttemptResult::ExplicitNetworkError { os_code } => format!(
-            "Explicit operating-system network error (code {})",
-            os_code.map_or_else(|| "not provided".to_owned(), |code| code.to_string())
-        ),
-        IcmpAttemptResult::Timeout => "Timed out with no ICMP response".to_owned(),
+        TcpAttemptResult::Timeout => "no TCP result before the deadline".to_owned(),
     }
 }
 
@@ -1293,173 +833,17 @@ fn dns_outcome_label(result: &DnsAttemptResult) -> String {
             aliases,
             truncated,
         } => format!(
-            "Response code {response_code}; addresses [{}]; aliases [{}]; truncated={truncated}",
-            addresses
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", "),
-            aliases
-                .iter()
-                .map(|alias| terminal_escape(alias))
-                .collect::<Vec<_>>()
-                .join(", ")
+            "DNS response code {response_code}; {}; {}; truncated={truncated}",
+            counted(addresses.len(), "address", "addresses"),
+            counted(aliases.len(), "alias", "aliases")
         ),
         DnsAttemptResult::TransportError { os_code } => format!(
-            "DNS transport error (OS code {})",
-            os_code.map_or_else(|| "not provided".to_owned(), |code| code.to_string())
+            "DNS transport error{}",
+            os_code.map_or_else(String::new, |code| format!(" (OS code {code})"))
         ),
         DnsAttemptResult::ProtocolError => "DNS protocol error".to_owned(),
-        DnsAttemptResult::Timeout => "DNS request timed out".to_owned(),
+        DnsAttemptResult::Timeout => "no DNS result before the deadline".to_owned(),
     }
-}
-
-fn initial_path_summary(path: &InitialPathAnalysis) -> String {
-    let status = match path.status {
-        InitialPathStatus::UsablePath => "usable",
-        InitialPathStatus::DefinitiveNoPath => "definitively unavailable",
-        InitialPathStatus::UnknownPath => "unknown",
-    };
-    let mut facts = vec![status.to_owned()];
-    if path.relation != PathRelation::Unknown {
-        facts.push(path_relation_label(path.relation).to_owned());
-    }
-    if let Some(interface) = &path.egress_interface {
-        facts.push(interface_short_label(interface));
-    }
-    if let Some(next_hop) = path.next_hop {
-        facts.push(format!("via {next_hop}"));
-    }
-    if let Some(source) = path.preferred_source {
-        facts.push(format!("source {source}"));
-    }
-    facts.join("; ")
-}
-
-fn current_path_summary(path: &CapabilityValue<OperationPathContext>) -> String {
-    match path {
-        CapabilityValue::Available { value, .. } => format!(
-            "{}; {}; next-hop={}; source={}",
-            path_relation_label(value.relation),
-            value.egress_interface.as_ref().map_or_else(
-                || "interface not identified".to_owned(),
-                interface_short_label
-            ),
-            optional_ip(value.next_hop),
-            optional_ip(value.preferred_source)
-        ),
-        CapabilityValue::Unknown { reason, .. } => {
-            format!("unknown ({})", capability_reason(reason))
-        }
-        CapabilityValue::Unavailable { reason, .. } => {
-            format!("unavailable ({})", capability_reason(reason))
-        }
-    }
-}
-
-fn neighbor_summary(value: &CapabilityValue<NeighborFact>) -> String {
-    match value {
-        CapabilityValue::Available { value, .. } => format!(
-            "{} for {}; {}; raw-state={}",
-            neighbor_state_label(value.state),
-            value.identity.address,
-            interface_short_label(&value.identity.interface),
-            value
-                .raw_state
-                .as_ref()
-                .map_or_else(|| "not provided".to_owned(), |state| terminal_escape(state))
-        ),
-        CapabilityValue::Unknown { reason, .. } => {
-            format!("unknown ({})", capability_reason(reason))
-        }
-        CapabilityValue::Unavailable { reason, .. } => {
-            format!("unavailable ({})", capability_reason(reason))
-        }
-    }
-}
-
-fn neighbor_pair_summary(facts: &TargetNetworkFacts) -> String {
-    match (&facts.neighbor_pre_state, &facts.neighbor_post_state) {
-        (None, None) => "not required or not observed".to_owned(),
-        (Some(before), None) => {
-            format!("before: {}; after: not observed", neighbor_summary(before))
-        }
-        (None, Some(after)) => format!("before: not observed; after: {}", neighbor_summary(after)),
-        (Some(before), Some(after)) => format!(
-            "before: {}; after: {}",
-            neighbor_summary(before),
-            neighbor_summary(after)
-        ),
-    }
-}
-
-fn route_summary(route: &RouteFact) -> String {
-    format!(
-        "{}; behavior={}; next-hop={}; interface={}; metric={}; table/compartment={}; source={}; ECMP-weight={}",
-        route.destination,
-        route_behavior_label(route.behavior),
-        optional_ip(route.next_hop),
-        route
-            .egress_interface
-            .as_ref()
-            .map_or_else(|| "not identified".to_owned(), interface_label),
-        optional_number(route.metric),
-        optional_number(route.table_or_compartment),
-        optional_ip(route.preferred_source),
-        optional_number(route.multipath_weight)
-    )
-}
-
-fn capability_count<T>(value: &CapabilityValue<Vec<T>>, singular: &str, plural: &str) -> String {
-    match value {
-        CapabilityValue::Available { value, .. } => {
-            format!("available ({})", counted(value.len(), singular, plural))
-        }
-        CapabilityValue::Unknown { reason, .. } => {
-            format!("unknown ({})", capability_reason(reason))
-        }
-        CapabilityValue::Unavailable { reason, .. } => {
-            format!("unavailable ({})", capability_reason(reason))
-        }
-    }
-}
-
-fn counted(count: usize, singular: &str, plural: &str) -> String {
-    if count == 1 {
-        format!("1 {singular}")
-    } else {
-        format!("{count} {plural}")
-    }
-}
-
-fn readable_detail(value: &str) -> String {
-    let mut value = terminal_escape(value);
-    for (internal, readable) in [
-        (
-            "NotExposedByOperatingSystem",
-            "not exposed by the operating system",
-        ),
-        (
-            "OrdinaryUserPermissionDenied",
-            "ordinary-user permission was denied",
-        ),
-        (
-            "SnapshotInconsistent",
-            "the local network snapshot was inconsistent",
-        ),
-        (
-            "QuerySemanticsUnavailable",
-            "the required read-only query semantics are unavailable",
-        ),
-        (
-            "AttemptCorrelationUnavailable",
-            "attempt correlation is unavailable",
-        ),
-        ("UnsupportedEnvironment", "the environment is unsupported"),
-    ] {
-        value = value.replace(internal, readable);
-    }
-    value
 }
 
 fn capability_reason(reason: &CapabilityReason) -> String {
@@ -1471,7 +855,7 @@ fn capability_reason(reason: &CapabilityReason) -> String {
             "ordinary-user permission was denied".to_owned()
         }
         CapabilityReason::SnapshotInconsistent => {
-            "the local network snapshot changed during capture".to_owned()
+            "a captured-fact cross-reference inconsistency was found".to_owned()
         }
         CapabilityReason::QuerySemanticsUnavailable => {
             "the required read-only query is not available".to_owned()
@@ -1486,19 +870,31 @@ fn capability_reason(reason: &CapabilityReason) -> String {
     }
 }
 
+fn neighbor_observation_label(value: NeighborObservation) -> &'static str {
+    match value {
+        NeighborObservation::NotSampled => "not sampled",
+        NeighborObservation::Observed(state) => neighbor_state_label(state),
+        NeighborObservation::Unknown => "unknown",
+        NeighborObservation::Unavailable => "unavailable",
+    }
+}
+
+const fn neighbor_state_label(value: NeighborState) -> &'static str {
+    match value {
+        NeighborState::Absent => "absent (no matching entry)",
+        NeighborState::Resolving => "resolving",
+        NeighborState::Usable => "usable",
+        NeighborState::TerminalFailure => "terminal failure",
+        NeighborState::Unknown => "unknown state",
+    }
+}
+
 fn all_targets_are(completed: &CompletedDiagnostic, conclusion: Conclusion) -> bool {
     !completed.targets.is_empty()
         && completed
             .targets
             .iter()
             .all(|target| target.conclusion == conclusion)
-}
-
-fn request_label(address: &str, port: Option<u16>) -> String {
-    port.map_or_else(
-        || terminal_escape(address),
-        |port| format!("{} {port}", terminal_escape(address)),
-    )
 }
 
 fn target_label(target: &TargetIp, port: Option<u16>) -> String {
@@ -1513,113 +909,16 @@ fn target_label(target: &TargetIp, port: Option<u16>) -> String {
     }
 }
 
-fn interface_label(interface: &reach_core::InterfaceId) -> String {
-    interface.stable_id.as_ref().map_or_else(
-        || format!("index {}", interface.index),
-        |stable| format!("index {} ({})", interface.index, terminal_escape(stable)),
-    )
-}
-
-fn interface_short_label(interface: &reach_core::InterfaceId) -> String {
-    format!("interface #{}", interface.index)
-}
-
-fn record_interface_identity(
-    identities: &mut BTreeMap<u32, BTreeSet<String>>,
-    interface: Option<&reach_core::InterfaceId>,
-) {
-    let Some(interface) = interface else {
-        return;
-    };
-    if let Some(stable_id) = &interface.stable_id {
-        identities
-            .entry(interface.index)
-            .or_default()
-            .insert(terminal_escape(stable_id));
-    }
-}
-
-fn grouped_targets(targets: &[String], total: usize) -> String {
-    if targets.len() == total && total > 1 {
-        format!("all {total} targets")
+fn counted(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
     } else {
-        targets.join(", ")
+        format!("{count} {plural}")
     }
-}
-
-fn optional_ip(value: Option<IpAddr>) -> String {
-    value.map_or_else(|| "not provided".to_owned(), |value| value.to_string())
-}
-
-fn optional_number<T: ToString>(value: Option<T>) -> String {
-    value.map_or_else(|| "not provided".to_owned(), |value| value.to_string())
-}
-
-fn raw_icmp_value(value: Option<u16>) -> String {
-    value.map_or_else(|| "not exposed".to_owned(), |value| value.to_string())
 }
 
 fn human_duration(value: Duration) -> String {
-    if value.is_zero() {
-        "0 ms".to_owned()
-    } else {
-        format_duration(value).to_string()
-    }
-}
-
-const fn path_relation_label(value: PathRelation) -> &'static str {
-    match value {
-        PathRelation::Local => "local",
-        PathRelation::OnLink => "on-link",
-        PathRelation::Remote => "remote",
-        PathRelation::Unknown => "unknown",
-    }
-}
-
-const fn neighbor_state_label(value: NeighborState) -> &'static str {
-    match value {
-        NeighborState::Resolving => "resolving",
-        NeighborState::Usable => "usable",
-        NeighborState::TerminalFailure => "terminal failure",
-        NeighborState::Unknown => "unknown",
-    }
-}
-
-const fn route_behavior_label(value: RouteBehavior) -> &'static str {
-    match value {
-        RouteBehavior::Unicast => "unicast",
-        RouteBehavior::Local => "local",
-        RouteBehavior::Broadcast => "broadcast",
-        RouteBehavior::Multicast => "multicast",
-        RouteBehavior::Reject => "reject",
-        RouteBehavior::Blackhole => "blackhole",
-        RouteBehavior::Unreachable => "unreachable",
-        RouteBehavior::Prohibit => "prohibit",
-        RouteBehavior::Throw => "throw",
-        RouteBehavior::Unknown => "unknown",
-    }
-}
-
-const fn resolver_transport_label(value: ResolverTransport) -> &'static str {
-    match value {
-        ResolverTransport::Udp => "UDP",
-        ResolverTransport::Tcp => "TCP",
-        ResolverTransport::Tls => "TLS",
-        ResolverTransport::Https => "HTTPS",
-        ResolverTransport::SystemPrivate => "system-private transport",
-        ResolverTransport::Unknown => "unknown transport",
-    }
-}
-
-const fn resolver_failure_label(value: SystemResolverFailureKind) -> &'static str {
-    match value {
-        SystemResolverFailureKind::DefinitiveNoName => "Definitive name-not-found result",
-        SystemResolverFailureKind::Temporary => "Temporary resolver failure",
-        SystemResolverFailureKind::Timeout => "Resolver timeout",
-        SystemResolverFailureKind::ResolverFailure => "Resolver failure",
-        SystemResolverFailureKind::OtherPlatformFailure => "Other operating-system failure",
-        SystemResolverFailureKind::Unknown => "Unknown resolver failure",
-    }
+    format_duration(value).to_string()
 }
 
 const fn dns_query_type_label(value: DnsQueryType) -> &'static str {
@@ -1631,22 +930,12 @@ const fn dns_query_type_label(value: DnsQueryType) -> &'static str {
 
 const fn icmp_kind_label(value: IcmpMessageKind) -> &'static str {
     match value {
-        IcmpMessageKind::EchoReply => "Echo Reply",
-        IcmpMessageKind::DestinationUnreachable => "Destination Unreachable",
-        IcmpMessageKind::TimeExceeded => "Time Exceeded",
-        IcmpMessageKind::PacketTooBig => "Packet Too Big",
-        IcmpMessageKind::ParameterProblem => "Parameter Problem",
-        IcmpMessageKind::Other => "Other ICMP message",
-    }
-}
-
-const fn evidence_role_label(value: EvidenceRole) -> &'static str {
-    match value {
-        EvidenceRole::PrimaryDecision => "primary decision",
-        EvidenceRole::AnomalyHistory => "anomaly history",
-        EvidenceRole::BoundaryNarrowing => "failure-boundary detail",
-        EvidenceRole::CapabilityLimitation => "capability limitation",
-        EvidenceRole::Context => "context",
+        IcmpMessageKind::EchoReply => "ICMP Echo Reply",
+        IcmpMessageKind::DestinationUnreachable => "ICMP Destination Unreachable",
+        IcmpMessageKind::TimeExceeded => "ICMP Time Exceeded",
+        IcmpMessageKind::PacketTooBig => "ICMP Packet Too Big",
+        IcmpMessageKind::ParameterProblem => "ICMP Parameter Problem",
+        IcmpMessageKind::Other => "other ICMP message",
     }
 }
 
@@ -1656,138 +945,61 @@ mod tests {
 
     use super::*;
     use reach_core::{
-        CapabilityReason, CapabilityValue, CompletedDiagnostic, Conclusion, Evidence, EvidenceFact,
-        EvidenceId, EvidenceRole, EvidenceSubject, HostnameResolutionOutcome,
-        InitialNetworkSnapshot, InterfaceFact, PrimaryOutcome, Provenance, ProvenanceSource,
-        ResolverConfiguration, RouteFact, TargetDiagnostic, TargetNetworkFacts,
-        analyze_initial_path, parse_request,
+        CapabilityValue, CompletedDiagnostic, EvidenceId, EvidenceRole, EvidenceSubject,
+        HostnameResolutionOutcome, IcmpNativeStatus, InitialNetworkSnapshot, InterfaceFact,
+        PrimaryOutcome, Provenance, ProvenanceSource, ResolverConfiguration, RouteFact,
+        TargetNetworkFacts, analyze_initial_path, parse_request,
     };
+    use unicode_width::UnicodeWidthStr as _;
 
     #[test]
-    fn tcp_timeout_and_icmp_reply_is_friendly_and_attempts_are_numbered() {
-        let snapshot = synthetic_snapshot();
-        let target_ip = TargetIp::v4(Ipv4Addr::new(192, 0, 2, 20));
-        let target = TargetDiagnostic::new(
-            target_ip.clone(),
-            Some(0),
-            PrimaryOutcome::NotSatisfied,
-            Conclusion::TcpTimedOutButTargetIcmpResponded,
-            TargetNetworkFacts {
-                initial_path: analyze_initial_path(&snapshot, &target_ip),
-                current_path: CapabilityValue::unavailable(
-                    CapabilityReason::QuerySemanticsUnavailable,
-                    provenance(),
-                ),
-                neighbor_pre_state: None,
-                neighbor_post_state: None,
-            },
-            vec![
-                attempt(
-                    1,
-                    AttemptKind::TcpConnect,
-                    AttemptOutcome::Tcp(TcpAttemptResult::Timeout),
-                    5,
-                ),
-                attempt(
-                    2,
-                    AttemptKind::TcpConnect,
-                    AttemptOutcome::Tcp(TcpAttemptResult::Timeout),
-                    5,
-                ),
-                attempt(
-                    3,
-                    AttemptKind::TargetIcmpEcho,
-                    AttemptOutcome::Icmp(IcmpAttemptResult::Message {
-                        kind: IcmpMessageKind::EchoReply,
-                        responder: target_ip.address,
-                        raw_type: Some(0),
-                        raw_code: Some(0),
-                    }),
-                    1,
-                ),
-            ],
-            vec![
-                attempt_evidence(1, &target_ip, EvidenceRole::AnomalyHistory),
-                attempt_evidence(2, &target_ip, EvidenceRole::PrimaryDecision),
-                attempt_evidence(3, &target_ip, EvidenceRole::BoundaryNarrowing),
-            ],
-        );
-        let completed = CompletedDiagnostic::new(
-            parse_request("example.com", Some("8443")).expect("valid request"),
-            snapshot,
-            None,
-            HostnameResolutionOutcome::Succeeded(reach_core::ResolverAddressSet::from_raw(vec![
-                target_ip,
-            ])),
-            vec![target],
-            Vec::new(),
-            Vec::new(),
-        );
-
+    fn timeout_and_icmp_reply_uses_only_numbered_key_evidence() {
+        let completed = timeout_then_icmp_result();
         let output = render(&completed, Theme::plain());
-        assert!(output.contains("TCP timed out twice; the IP address replied to ICMP Echo"));
-        assert!(output.contains("1 (A1)"));
-        assert!(output.contains("2 (A2)"));
-        assert!(output.contains("3 (A3)"));
-        assert!(output.contains("A timeout does not prove that the port is closed"));
-        assert!(!output.contains("formal target"));
-        assert!(!output.contains("TCP timed out\n  - 192.0.2.20: TCP timed out"));
+
+        assert!(output.contains("Two TCP connection attempts to 192.0.2.20:8443 timed out"));
+        assert!(output.contains("That IP address replied to ICMP Echo"));
+        assert!(output.contains("TCP connect #1: No result before the 5s deadline"));
+        assert!(output.contains("TCP connect #2: No result before the 5s deadline"));
+        assert!(output.contains("ICMP Echo #3: ICMP Echo Reply from 192.0.2.20"));
+        assert!(output.contains("This does not prove that the port is closed"));
+        for forbidden in [
+            "TECHNICAL DETAILS",
+            "NETWORK ATTEMPTS",
+            "PATH AND NEIGHBOR FACTS",
+            "raw-state=",
+            "Interface identity",
+            "System DNS",
+            "send this entire report",
+        ] {
+            assert!(
+                !output.contains(forbidden),
+                "unexpected {forbidden:?}\n{output}"
+            );
+        }
     }
 
     #[test]
-    fn redirected_success_report_has_no_ansi_and_explains_scope() {
-        let snapshot = synthetic_snapshot();
-        let target_ip = TargetIp::v4(Ipv4Addr::LOCALHOST);
-        let target = TargetDiagnostic::new(
-            target_ip.clone(),
-            Some(0),
-            PrimaryOutcome::Satisfied,
-            Conclusion::IcmpEchoReplied,
-            TargetNetworkFacts {
-                initial_path: analyze_initial_path(&snapshot, &target_ip),
-                current_path: CapabilityValue::unavailable(
-                    CapabilityReason::QuerySemanticsUnavailable,
-                    provenance(),
-                ),
-                neighbor_pre_state: None,
-                neighbor_post_state: None,
-            },
-            vec![attempt(
-                1,
-                AttemptKind::TargetIcmpEcho,
-                AttemptOutcome::Icmp(IcmpAttemptResult::Message {
-                    kind: IcmpMessageKind::EchoReply,
-                    responder: target_ip.address,
-                    raw_type: Some(0),
-                    raw_code: Some(0),
-                }),
-                1,
-            )],
-            vec![attempt_evidence(
-                1,
-                &target_ip,
-                EvidenceRole::PrimaryDecision,
-            )],
-        );
-        let completed = CompletedDiagnostic::new(
-            parse_request("127.0.0.1", None).expect("valid request"),
-            snapshot,
-            None,
-            HostnameResolutionOutcome::NotRequested,
-            vec![target],
-            Vec::new(),
-            Vec::new(),
-        );
+    fn clean_success_stops_after_the_minimum_explanation() {
+        let completed = clean_icmp_success();
         let output = render(&completed, Theme::plain());
+
         assert!(output.starts_with("✓ ADDRESS RESPONDED\n"));
         assert!(output.contains("This does not test a TCP port, website"));
-        assert!(output.contains("Exit code          0"));
+        assert!(!output.contains("EVIDENCE"));
+        assert!(!output.contains("TECHNICAL DETAILS"));
+        assert!(!output.contains("0 ms"));
         assert!(!output.contains('\u{1b}'));
     }
 
     #[test]
-    fn definitive_dns_negative_is_explained_without_internal_vocabulary() {
-        let completed = CompletedDiagnostic::new(
+    fn name_resolution_is_never_called_system_dns() {
+        let completed = timeout_then_icmp_result();
+        let output = render(&completed, Theme::plain());
+        assert!(output.contains("Name resolution"));
+        assert!(!output.to_ascii_lowercase().contains("system dns"));
+
+        let negative = CompletedDiagnostic::new(
             parse_request("missing.invalid", None).expect("valid request"),
             synthetic_snapshot(),
             None,
@@ -1796,18 +1008,154 @@ mod tests {
             },
             Vec::new(),
             Vec::new(),
-            Vec::new(),
+            vec![Evidence {
+                id: EvidenceId(1),
+                subject: EvidenceSubject::Hostname,
+                role: EvidenceRole::PrimaryDecision,
+                fact: EvidenceFact::SystemResolverResult("definitive negative".into()),
+            }],
         );
-        let output = render(&completed, Theme::plain());
+        let output = render(&negative, Theme::plain());
         assert!(output.starts_with("× NAME WAS NOT FOUND\n"));
-        assert!(output.contains("No destination connection or ICMP check was started"));
-        assert!(output.contains("Exit code          1"));
-        assert!(!output.contains("formal target"));
-        assert!(!output.contains("aggregate"));
+        assert!(output.contains("System name resolution"));
+        assert!(output.contains("Name resolution: name does not exist"));
+        assert!(!output.to_ascii_lowercase().contains("system dns"));
     }
 
     #[test]
-    fn mixed_addresses_are_kept_separate_and_shared_together() {
+    fn extra_context_attempts_never_leak_into_default_output() {
+        let mut completed = timeout_then_icmp_result();
+        let target = &mut completed.targets[0];
+        target.attempts.push(attempt(
+            99,
+            AttemptKind::NextHopIcmpEcho,
+            AttemptOutcome::Icmp(IcmpAttemptResult::ExplicitNetworkError {
+                os_code: Some(9_999),
+            }),
+            Duration::from_secs(1),
+            Duration::from_millis(2),
+        ));
+        target.evidence.push(Evidence {
+            id: EvidenceId(99),
+            subject: EvidenceSubject::Target(target.target.clone()),
+            role: EvidenceRole::Context,
+            fact: EvidenceFact::Attempt(AttemptId(99)),
+        });
+
+        let output = render(&completed, Theme::plain());
+        assert!(!output.contains("9999"));
+        assert!(!output.contains("Next-hop"));
+    }
+
+    #[test]
+    fn windows_native_status_cannot_appear_as_an_icmp_wire_code() {
+        let outcome = AttemptOutcome::Icmp(IcmpAttemptResult::Message {
+            kind: IcmpMessageKind::EchoReply,
+            responder: Ipv4Addr::LOCALHOST.into(),
+            raw_type: None,
+            raw_code: None,
+            native_status: Some(IcmpNativeStatus::WindowsIpHelper(0)),
+        });
+        let rendered = friendly_attempt_outcome(&outcome);
+        assert_eq!(rendered, "ICMP Echo Reply from 127.0.0.1");
+        assert!(!rendered.contains("raw"));
+        assert!(!rendered.contains("status"));
+    }
+
+    #[test]
+    fn zero_duration_is_described_as_clock_resolution_not_a_latency_claim() {
+        let attempt = attempt(
+            1,
+            AttemptKind::TargetIcmpEcho,
+            AttemptOutcome::Icmp(IcmpAttemptResult::ExplicitNetworkError { os_code: None }),
+            Duration::from_secs(2),
+            Duration::ZERO,
+        );
+        let rendered = attempt_evidence_summary(&attempt, 1);
+        assert!(rendered.contains("same observable clock reading"));
+        assert!(!rendered.contains("0 ms"));
+        assert!(!rendered.contains("<1"));
+    }
+
+    #[test]
+    fn deadline_wording_does_not_report_scheduler_tail_as_budget() {
+        let attempt = attempt(
+            1,
+            AttemptKind::TcpConnect,
+            AttemptOutcome::Tcp(TcpAttemptResult::Timeout),
+            Duration::from_secs(5),
+            Duration::from_millis(5_016),
+        );
+        let rendered = attempt_evidence_summary(&attempt, 1);
+        assert_eq!(
+            rendered,
+            "TCP connect #1: No result before the 5s deadline."
+        );
+        assert!(!rendered.contains("5s 16ms"));
+        assert!(!rendered.contains("/ 5s"));
+    }
+
+    #[test]
+    fn neighbor_observation_states_are_not_conflated() {
+        assert_eq!(
+            neighbor_observation_label(NeighborObservation::NotSampled),
+            "not sampled"
+        );
+        assert_eq!(
+            neighbor_observation_label(NeighborObservation::Observed(NeighborState::Absent)),
+            "absent (no matching entry)"
+        );
+        assert_eq!(
+            neighbor_observation_label(NeighborObservation::Unknown),
+            "unknown"
+        );
+        assert_eq!(
+            neighbor_observation_label(NeighborObservation::Unavailable),
+            "unavailable"
+        );
+    }
+
+    #[test]
+    fn snapshot_inconsistency_never_claims_temporal_change() {
+        let evidence = Evidence {
+            id: EvidenceId(1),
+            subject: EvidenceSubject::Run,
+            role: EvidenceRole::CapabilityLimitation,
+            fact: EvidenceFact::SnapshotInconsistency("route refers to missing interface".into()),
+        };
+        let rendered = evidence_summary(&timeout_then_icmp_result(), &evidence);
+        assert!(rendered.starts_with("Snapshot cross-check found an inconsistency"));
+        assert!(!rendered.contains("changed"));
+        assert!(!rendered.contains("stable"));
+    }
+
+    #[test]
+    fn one_address_uses_singular_pronouns() {
+        let output = render(&timeout_then_icmp_result(), Theme::plain());
+        assert!(output.contains("That IP address"));
+        assert!(!output.contains("all 1 IP address"));
+        assert!(!output.contains("The same IP addresses"));
+    }
+
+    #[test]
+    fn layouts_from_twenty_to_three_hundred_columns_do_not_overflow() {
+        let completed = timeout_then_icmp_result();
+        for width in [20_u16, 40, 59, 60, 80, 120, 140, 300] {
+            let output = render(&completed, Theme::plain_with_width(width));
+            for line in output.lines() {
+                assert!(
+                    line.width() <= usize::from(width),
+                    "width {width}, rendered {} columns: {line:?}\n{output}",
+                    line.width()
+                );
+            }
+            assert!(output.contains("192.0.2.20:8443"));
+            assert!(output.contains("EVIDENCE"));
+        }
+    }
+
+    #[test]
+    fn mixed_addresses_remain_separate() {
         let snapshot = synthetic_snapshot();
         let first = TargetIp::v4(Ipv4Addr::new(192, 0, 2, 1));
         let second = TargetIp::v4(Ipv4Addr::new(192, 0, 2, 2));
@@ -1842,8 +1190,7 @@ mod tests {
         assert!(output.starts_with("! RESULTS DIFFER BETWEEN IP ADDRESSES\n"));
         assert!(output.contains("192.0.2.1:443"));
         assert!(output.contains("192.0.2.2:443"));
-        assert!(output.contains("Do not remove the addresses that failed"));
-        assert!(output.contains("Exit code          1"));
+        assert!(output.contains("Keep every address and result"));
     }
 
     #[test]
@@ -1868,7 +1215,6 @@ mod tests {
         let output = render(&completed, Theme::plain());
         assert!(output.starts_with("! REACHABLE, BUT A RETRY WAS NEEDED\n"));
         assert!(output.contains("later success does not erase the first timeout"));
-        assert!(output.contains("Exit code          1"));
     }
 
     #[test]
@@ -1895,11 +1241,10 @@ mod tests {
         assert!(output.starts_with("× NO ICMP REPLY WAS CONFIRMED\n"));
         assert!(flattened.contains("does not prove that the destination is down"));
         assert!(output.contains("? INCONCLUSIVE"));
-        assert!(output.contains("Exit code          1"));
     }
 
     #[test]
-    fn every_conclusion_has_a_plain_language_diagnostic_label() {
+    fn every_conclusion_has_a_plain_language_label() {
         let conclusions = [
             Conclusion::TcpConnectSucceeded,
             Conclusion::TcpConnectSucceededAfterTimeout,
@@ -1937,19 +1282,138 @@ mod tests {
             assert!(!label.is_empty());
             assert!(!label.contains("formal"));
             assert!(!label.contains("CapabilityValue"));
-            assert!(!label.contains("Indeterminate"));
+            assert!(!label.contains("System DNS"));
         }
     }
 
-    fn attempt(id: u64, kind: AttemptKind, outcome: AttemptOutcome, seconds: u64) -> Attempt {
+    fn timeout_then_icmp_result() -> CompletedDiagnostic {
+        let snapshot = synthetic_snapshot();
+        let target_ip = TargetIp::v4(Ipv4Addr::new(192, 0, 2, 20));
+        let target = TargetDiagnostic::new(
+            target_ip.clone(),
+            Some(0),
+            PrimaryOutcome::NotSatisfied,
+            Conclusion::TcpTimedOutButTargetIcmpResponded,
+            TargetNetworkFacts {
+                initial_path: analyze_initial_path(&snapshot, &target_ip),
+                current_path: CapabilityValue::unavailable(
+                    CapabilityReason::QuerySemanticsUnavailable,
+                    provenance(),
+                ),
+                neighbor_pre_state: None,
+                neighbor_post_state: None,
+            },
+            vec![
+                attempt(
+                    1,
+                    AttemptKind::TcpConnect,
+                    AttemptOutcome::Tcp(TcpAttemptResult::Timeout),
+                    Duration::from_secs(5),
+                    Duration::from_millis(5_016),
+                ),
+                attempt(
+                    2,
+                    AttemptKind::TcpConnect,
+                    AttemptOutcome::Tcp(TcpAttemptResult::Timeout),
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                ),
+                attempt(
+                    3,
+                    AttemptKind::TargetIcmpEcho,
+                    AttemptOutcome::Icmp(IcmpAttemptResult::Message {
+                        kind: IcmpMessageKind::EchoReply,
+                        responder: target_ip.address,
+                        raw_type: None,
+                        raw_code: None,
+                        native_status: Some(IcmpNativeStatus::WindowsIpHelper(0)),
+                    }),
+                    Duration::from_secs(2),
+                    Duration::from_millis(15),
+                ),
+            ],
+            vec![
+                attempt_evidence(1, &target_ip, EvidenceRole::AnomalyHistory),
+                attempt_evidence(2, &target_ip, EvidenceRole::PrimaryDecision),
+                attempt_evidence(3, &target_ip, EvidenceRole::BoundaryNarrowing),
+            ],
+        );
+        CompletedDiagnostic::new(
+            parse_request("example.com", Some("8443")).expect("valid request"),
+            snapshot,
+            None,
+            HostnameResolutionOutcome::Succeeded(reach_core::ResolverAddressSet::from_raw(vec![
+                target_ip,
+            ])),
+            vec![target],
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn clean_icmp_success() -> CompletedDiagnostic {
+        let snapshot = synthetic_snapshot();
+        let target_ip = TargetIp::v4(Ipv4Addr::LOCALHOST);
+        let target = TargetDiagnostic::new(
+            target_ip.clone(),
+            Some(0),
+            PrimaryOutcome::Satisfied,
+            Conclusion::IcmpEchoReplied,
+            TargetNetworkFacts {
+                initial_path: analyze_initial_path(&snapshot, &target_ip),
+                current_path: CapabilityValue::unavailable(
+                    CapabilityReason::QuerySemanticsUnavailable,
+                    provenance(),
+                ),
+                neighbor_pre_state: None,
+                neighbor_post_state: None,
+            },
+            vec![attempt(
+                1,
+                AttemptKind::TargetIcmpEcho,
+                AttemptOutcome::Icmp(IcmpAttemptResult::Message {
+                    kind: IcmpMessageKind::EchoReply,
+                    responder: target_ip.address,
+                    raw_type: Some(0),
+                    raw_code: Some(0),
+                    native_status: None,
+                }),
+                Duration::from_secs(2),
+                Duration::ZERO,
+            )],
+            vec![attempt_evidence(
+                1,
+                &target_ip,
+                EvidenceRole::PrimaryDecision,
+            )],
+        );
+        CompletedDiagnostic::new(
+            parse_request("127.0.0.1", None).expect("valid request"),
+            snapshot,
+            None,
+            HostnameResolutionOutcome::NotRequested,
+            vec![target],
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn attempt(
+        id: u64,
+        kind: AttemptKind,
+        outcome: AttemptOutcome,
+        budget: Duration,
+        recorded_duration: Duration,
+    ) -> Attempt {
+        let started_at = Duration::from_secs(id);
         Attempt {
             id: AttemptId(id),
             subject: reach_core::AttemptSubject::Target(TargetIp::v4(Ipv4Addr::new(192, 0, 2, 20))),
             kind,
             timing: reach_core::AttemptTiming {
-                started_at: Duration::from_secs(id),
-                deadline_at: Duration::from_secs(id + seconds),
-                completed_at: Duration::from_secs(id + seconds),
+                started_at,
+                deadline_at: started_at + budget,
+                completed_at: started_at + recorded_duration,
             },
             outcome,
             provenance: provenance(),

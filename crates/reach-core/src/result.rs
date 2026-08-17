@@ -102,7 +102,7 @@ pub enum EvidenceFact {
     InitialPath(String),
     CurrentPath(String),
     NeighborTransition {
-        before: Option<crate::NeighborState>,
+        before: NeighborObservation,
         after: crate::NeighborState,
     },
     SystemResolverResult(String),
@@ -113,6 +113,17 @@ pub enum EvidenceFact {
     },
     SnapshotInconsistency(String),
     SocketPathComparison(String),
+}
+
+/// Whether the pre-operation Neighbor fact was sampled and what that sample
+/// could prove. This keeps a skipped read distinct from an observed absence or
+/// a capability boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NeighborObservation {
+    NotSampled,
+    Observed(crate::NeighborState),
+    Unknown,
+    Unavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -157,7 +168,10 @@ pub struct TargetDiagnostic {
 pub struct TargetNetworkFacts {
     pub initial_path: InitialPathAnalysis,
     pub current_path: CapabilityValue<OperationPathContext>,
+    /// `None` means the read was not sampled for this diagnostic path.
     pub neighbor_pre_state: Option<CapabilityValue<NeighborFact>>,
+    /// `None` means the post-operation read was not sampled because the state
+    /// machine did not require it.
     pub neighbor_post_state: Option<CapabilityValue<NeighborFact>>,
 }
 

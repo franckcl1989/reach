@@ -28,6 +28,7 @@ unicode-general-category.workspace = true
 assert_cmd.workspace = true
 send_ctrlc.workspace = true
 snapbox.workspace = true
+unicode-width.workspace = true
 wait-timeout.workspace = true
 
 [lints]

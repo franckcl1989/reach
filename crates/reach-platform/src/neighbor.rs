@@ -33,7 +33,7 @@ pub async fn capture_neighbor(
         Ok(None) => CapabilityValue::available(
             NeighborFact {
                 identity: identity.clone(),
-                state: NeighborState::Unknown,
+                state: NeighborState::Absent,
                 observed_at,
                 raw_state: Some("absent".into()),
                 provenance: provenance.clone(),
@@ -323,7 +323,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(any(windows, target_os = "linux"))]
-    async fn passive_missing_neighbor_is_an_available_unknown_fact() {
+    async fn passive_missing_neighbor_is_observed_as_absent() {
         let interfaces = crate::capture_interfaces(Duration::ZERO);
         let CapabilityValue::Available {
             value: interfaces, ..
@@ -352,7 +352,7 @@ mod tests {
                 panic!("a successful query with no entry is a known absence: {result:?}");
             };
             assert_eq!(value.identity, identity);
-            assert_eq!(value.state, NeighborState::Unknown);
+            assert_eq!(value.state, NeighborState::Absent);
             assert_eq!(value.raw_state.as_deref(), Some("absent"));
         }
     }

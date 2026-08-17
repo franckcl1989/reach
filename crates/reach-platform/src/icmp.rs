@@ -1,5 +1,7 @@
 use std::{net::IpAddr, time::Duration};
 
+#[cfg(windows)]
+use reach_core::IcmpNativeStatus;
 use reach_core::{
     Attempt, AttemptId, AttemptKind, AttemptOutcome, AttemptSubject, AttemptTiming,
     IcmpAttemptResult, IcmpMessageKind, NeighborIdentity, Provenance, ProvenanceSource, TargetIp,
@@ -170,6 +172,7 @@ fn icmpv4_result(responder: IpAddr, raw_type: u8, raw_code: u8) -> IcmpAttemptRe
         responder,
         raw_type: Some(u16::from(raw_type)),
         raw_code: Some(u16::from(raw_code)),
+        native_status: None,
     }
 }
 
@@ -188,6 +191,7 @@ fn icmpv6_result(responder: IpAddr, raw_type: u8, raw_code: u8) -> IcmpAttemptRe
         responder,
         raw_type: Some(u16::from(raw_type)),
         raw_code: Some(u16::from(raw_code)),
+        native_status: None,
     }
 }
 
@@ -429,7 +433,8 @@ fn windows_status(status: u32, responder: IpAddr) -> Result<IcmpAttemptResult, P
         kind,
         responder,
         raw_type: None,
-        raw_code: u16::try_from(status).ok(),
+        raw_code: None,
+        native_status: Some(IcmpNativeStatus::WindowsIpHelper(status)),
     })
 }
 
@@ -453,6 +458,7 @@ mod tests {
                 responder: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 raw_type: Some(3),
                 raw_code: Some(4),
+                native_status: None,
             }
         );
         assert!(matches!(
@@ -473,6 +479,7 @@ mod tests {
                 responder: IpAddr::V6(Ipv6Addr::LOCALHOST),
                 raw_type: Some(3),
                 raw_code: Some(0),
+                native_status: None,
             }
         );
         assert!(matches!(
@@ -486,7 +493,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_status_preserves_native_status_code() {
+    fn windows_status_keeps_native_status_out_of_wire_fields() {
         use windows_sys::Win32::NetworkManagement::IpHelper::{
             IP_DEST_NET_UNREACHABLE, IP_PACKET_TOO_BIG, IP_REQ_TIMED_OUT,
         };
@@ -498,7 +505,8 @@ mod tests {
                 kind: IcmpMessageKind::PacketTooBig,
                 responder: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 raw_type: None,
-                raw_code: u16::try_from(IP_PACKET_TOO_BIG).ok(),
+                raw_code: None,
+                native_status: Some(IcmpNativeStatus::WindowsIpHelper(IP_PACKET_TOO_BIG)),
             }
         );
         assert_eq!(

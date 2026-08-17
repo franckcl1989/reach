@@ -12,13 +12,14 @@ use crate::{
     FormalTarget, Hostname, HostnameResolutionOutcome, IcmpAttemptResult, IcmpEchoSubject,
     IcmpMessageKind, IcmpOperation, InitialNetworkSnapshot, InitialPathAnalysis, InitialPathStatus,
     MAX_ACTIVE_RESOLVERS, MAX_ACTIVE_TARGETS, MAX_PATH_HOP_LIMIT, NEXT_HOP_ICMP_BUDGET,
-    NeighborDependency, NeighborFact, NeighborIdentity, NeighborState, OperationPathContext,
-    PATH_ATTEMPT_BUDGET, ParsedRequest, PathOperation, PathRelation, PrimaryOutcome, Provenance,
-    ProvenanceSource, ResolverDependencyDiagnostic, ResolverEndpoint, ResolverTransport,
-    SnapshotInconsistencyScope, SystemResolverFailureKind, SystemResolverObservation,
-    SystemResolverResult, TARGET_ICMP_BUDGET, TCP_CONNECT_BUDGET, TargetDiagnostic, TargetIp,
-    TargetNetworkFacts, TcpAttemptResult, TcpOperation, analyze_initial_path,
-    bind_diagnostic_request, neighbor_dependency_for_path, reconcile_current_operation_path,
+    NeighborDependency, NeighborFact, NeighborIdentity, NeighborObservation, NeighborState,
+    OperationPathContext, PATH_ATTEMPT_BUDGET, ParsedRequest, PathOperation, PathRelation,
+    PrimaryOutcome, Provenance, ProvenanceSource, ResolverDependencyDiagnostic, ResolverEndpoint,
+    ResolverTransport, SnapshotInconsistencyScope, SystemResolverFailureKind,
+    SystemResolverObservation, SystemResolverResult, TARGET_ICMP_BUDGET, TCP_CONNECT_BUDGET,
+    TargetDiagnostic, TargetIp, TargetNetworkFacts, TcpAttemptResult, TcpOperation,
+    analyze_initial_path, bind_diagnostic_request, neighbor_dependency_for_path,
+    reconcile_current_operation_path,
 };
 
 pub async fn run_diagnostic(
@@ -1178,7 +1179,10 @@ async fn diagnose_port_target(
     }
 
     let mut diagnostic_conclusions = Vec::new();
-    if post_state == Some(NeighborState::Unknown) {
+    if matches!(
+        post_state,
+        Some(NeighborState::Absent | NeighborState::Unknown)
+    ) {
         add_neighbor_evidence(facts, evidence, EvidenceRole::BoundaryNarrowing, ids.next());
         diagnostic_conclusions.push(Conclusion::NeighborResolutionIndeterminate);
     }
@@ -1358,7 +1362,10 @@ async fn diagnose_address_target(
     }
 
     let mut diagnostic_conclusions = Vec::new();
-    if post_state == Some(NeighborState::Unknown) {
+    if matches!(
+        post_state,
+        Some(NeighborState::Absent | NeighborState::Unknown)
+    ) {
         add_neighbor_evidence(facts, evidence, EvidenceRole::BoundaryNarrowing, ids.next());
         diagnostic_conclusions.push(Conclusion::NeighborResolutionIndeterminate);
     }
@@ -2130,10 +2137,14 @@ fn add_neighbor_evidence(
         subject: EvidenceSubject::Neighbor(value.identity.clone()),
         role,
         fact: EvidenceFact::NeighborTransition {
-            before: facts
-                .neighbor_pre_state
-                .as_ref()
-                .and_then(capability_neighbor_state),
+            before: match &facts.neighbor_pre_state {
+                None => NeighborObservation::NotSampled,
+                Some(CapabilityValue::Available { value, .. }) => {
+                    NeighborObservation::Observed(value.state)
+                }
+                Some(CapabilityValue::Unknown { .. }) => NeighborObservation::Unknown,
+                Some(CapabilityValue::Unavailable { .. }) => NeighborObservation::Unavailable,
+            },
             after: value.state,
         },
     });
@@ -2999,6 +3010,7 @@ mod tests {
             responder: responder.into(),
             raw_type: Some(1),
             raw_code: Some(0),
+            native_status: None,
         }
     }
 
@@ -3828,7 +3840,7 @@ mod tests {
             matches!(
                 evidence.fact,
                 EvidenceFact::NeighborTransition {
-                    before: Some(NeighborState::Usable),
+                    before: NeighborObservation::Observed(NeighborState::Usable),
                     after: NeighborState::TerminalFailure,
                 }
             )
@@ -3889,6 +3901,33 @@ mod tests {
                     }
                 ))
         );
+
+        let absent_io = ScriptedIo::new(snapshot(Some(RouteBehavior::Unicast)))
+            .with_remote_path()
+            .with_neighbor_states([NeighborState::Usable, NeighborState::Absent])
+            .with_icmp([IcmpAttemptResult::Timeout, IcmpAttemptResult::Timeout]);
+        let absent = completed(
+            run_diagnostic(
+                parse_request("203.0.113.10", None).expect("valid request"),
+                &absent_io,
+                &CancellationToken::new(),
+            )
+            .await,
+        );
+        assert_eq!(absent.targets[0].conclusion, Conclusion::IcmpEchoTimedOut);
+        assert_eq!(
+            absent.targets[0].diagnostic_conclusions,
+            vec![Conclusion::NeighborResolutionIndeterminate]
+        );
+        assert!(absent.targets[0].key_evidence.iter().any(|evidence| {
+            matches!(
+                evidence.fact,
+                EvidenceFact::NeighborTransition {
+                    after: NeighborState::Absent,
+                    ..
+                }
+            )
+        }));
     }
 
     #[tokio::test]
@@ -4135,12 +4174,14 @@ mod tests {
                         responder: first_responder.into(),
                         raw_type: Some(11),
                         raw_code: Some(0),
+                        native_status: None,
                     },
                     crate::IcmpMessageObservation {
                         kind: IcmpMessageKind::TimeExceeded,
                         responder: second_responder.into(),
                         raw_type: Some(11),
                         raw_code: Some(0),
+                        native_status: None,
                     },
                 ]))),
                 Some(AttemptOutcome::Tcp(connected())),

@@ -305,6 +305,8 @@ pub struct NeighborIdentity {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NeighborState {
+    /// The read completed successfully and no matching Neighbor entry existed.
+    Absent,
     Resolving,
     Usable,
     TerminalFailure,
@@ -404,12 +406,22 @@ pub enum IcmpMessageKind {
     Other,
 }
 
+/// Status returned by a native API when it is not an observed ICMP wire field.
+///
+/// Keeping the status domain in the type prevents a platform status with the
+/// same integer representation from being mistaken for an ICMP header value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IcmpNativeStatus {
+    WindowsIpHelper(u32),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcmpMessageObservation {
     pub kind: IcmpMessageKind,
     pub responder: IpAddr,
     pub raw_type: Option<u16>,
     pub raw_code: Option<u16>,
+    pub native_status: Option<IcmpNativeStatus>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -419,6 +431,7 @@ pub enum IcmpAttemptResult {
         responder: IpAddr,
         raw_type: Option<u16>,
         raw_code: Option<u16>,
+        native_status: Option<IcmpNativeStatus>,
     },
     /// Multiple responses reliably correlated to the same path Attempt. This
     /// preserves responder identities without interpreting why they differ.

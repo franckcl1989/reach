@@ -2,8 +2,8 @@
 
 `reach` is a conservative cross-platform network diagnostic CLI for Linux,
 macOS, and Windows on x86-64 and ARM64. Its diagnostic behavior is defined by
-`network-diagnostic-cli-design.md`; the friendlier 0.1.1 presentation contract
-is defined by `docs/0.1.1-output-contract.md`.
+`network-diagnostic-cli-design.md`, including the current default-output
+contract. The 0.1.1 presentation note is retained only as release history.
 
 ## Usage
 
@@ -20,12 +20,11 @@ reach <address> [port]
 Completed diagnostics go to stdout. Execution errors, cancellation, and
 TTY-only transient progress go to stderr.
 
-Reports use progressive disclosure: a plain-language verdict and explanation
-come first, followed by every destination result and cautious next steps. The
-same report ends with complete support details, including ordered DNS results,
-all network Attempts with timing and limits, and relevant path, Neighbor, and
-capability facts. A user can therefore read the top and send the entire output
-unchanged to a network engineer when help is needed.
+Default output contains a plain-language verdict, the check, every destination
+result, its meaning, cautious next steps when needed, and only the minimum Key
+Evidence selected by Core. Clean success is deliberately shorter. Complete
+Attempt, path, Neighbor, resolver, and capability evidence remains in the typed
+internal result model; it is not dumped by default.
 
 | Exit | Meaning |
 |---:|---|
@@ -67,7 +66,10 @@ job runs the ordinary-user conformance suite, builds and executes the native
 binary, and produces one archive containing exactly one `reach` executable.
 The successful 0.1.0 native capability evidence is recorded in
 `docs/0.1.0-native-capability-matrix.md`; the 0.1.1 output, test, CI, and
-artifact evidence is recorded in `docs/0.1.1-release-evidence.md`.
+artifact evidence is historical in `docs/0.1.1-release-evidence.md`. The
+0.1.2 release evidence is attached directly to the GitHub Release so no
+post-gate documentation commit can separate the tag from the tested artifact
+source.
 
 ## Architecture and dependency policy
 
