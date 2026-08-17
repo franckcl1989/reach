@@ -17,10 +17,12 @@ fn invalid_input_is_stderr_only_exit_two_and_cannot_inject_a_line() {
         .code(2);
     let output = assertion.get_output();
     assert!(output.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "reach: address is not a valid hostname or IP literal\n"
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("× ADDRESS IS NOT VALID\n"));
+    assert!(stderr.contains("Reach could not read the address"));
+    assert!(stderr.contains("Address            bad\\n\\u{1b}[31m"));
+    assert!(stderr.contains("Exit code          2"));
+    assert!(!stderr.contains('\u{1b}'));
 }
 
 #[test]
@@ -30,6 +32,14 @@ fn redirected_help_is_plain_stdout_without_progress_or_ansi() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Usage: reach <ADDRESS> [PORT]"));
     assert!(!stdout.contains('\u{1b}'));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn version_reports_the_0_1_1_release() {
+    let assertion = cargo_bin_cmd!("reach").arg("--version").assert().code(0);
+    let output = assertion.get_output();
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "reach 0.1.1\n");
     assert!(output.stderr.is_empty());
 }
 
@@ -44,13 +54,15 @@ fn ordinary_user_loopback_success_is_a_completed_stdout_result() {
         .code(0);
     let output = assertion.get_output();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("result: all targets satisfied"));
-    assert!(stdout.contains(&format!("target 127.0.0.1:{port}: satisfied")));
+    assert!(stdout.starts_with("✓ TCP CONNECTION SUCCEEDED\n"));
+    assert!(stdout.contains(&format!("A TCP connection to 127.0.0.1:{port} succeeded")));
+    assert!(stdout.contains("The TCP handshake completed"));
+    assert!(stdout.contains("Reach did not send application data"));
+    assert!(stdout.contains("NETWORK ATTEMPTS"));
+    assert!(stdout.contains("1 / A"));
+    assert!(stdout.contains("Exit code          0"));
+    assert!(!stdout.contains("formal target"));
     assert!(!stdout.contains('\u{1b}'));
-    assert!(
-        stdout.lines().count() <= 8,
-        "success output should stay concise"
-    );
     assert!(output.stderr.is_empty());
 }
 
@@ -66,8 +78,14 @@ fn completed_network_failure_is_stdout_only_and_exit_one() {
         .code(1);
     let output = assertion.get_output();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("result: network check not satisfied"));
-    assert!(stdout.contains("TCP connection was refused"));
+    assert!(stdout.starts_with("× TCP CONNECTION WAS REFUSED\n"));
+    assert!(stdout.contains("TCP connection was explicitly refused"));
+    assert!(stdout.contains("The refusal may come from the destination or an intermediate device"));
+    assert!(stdout.contains("WHAT TO DO"));
+    assert!(stdout.contains("PATH AND NEIGHBOR FACTS"));
+    assert!(stdout.contains("NETWORK ATTEMPTS"));
+    assert!(stdout.contains("Exit code          1"));
+    assert!(!stdout.contains('\u{1b}'));
     assert!(output.stderr.is_empty());
 }
 
@@ -130,5 +148,51 @@ fn console_interrupt_is_a_bounded_cancelled_process_result() {
         .expect("read stderr");
     assert_eq!(status.code(), Some(130));
     assert!(stdout.is_empty());
-    assert!(String::from_utf8_lossy(&stderr).starts_with("reach: cancelled:"));
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert!(stderr.starts_with("! CHECK CANCELLED\n"));
+    assert!(stderr.contains("No final network result was produced"));
+    assert!(stderr.contains("Exit code          130"));
+    assert!(!stderr.contains('\u{1b}'));
+}
+
+#[test]
+fn missing_address_has_friendly_usage_and_examples() {
+    let assertion = cargo_bin_cmd!("reach").assert().code(2);
+    let output = assertion.get_output();
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("× ADDRESS IS MISSING\n"));
+    assert!(stderr.contains("reach <ADDRESS> [PORT]"));
+    assert!(stderr.contains("reach example.com 443"));
+    assert!(stderr.contains("Exit code          2"));
+}
+
+#[test]
+fn invalid_port_explains_the_allowed_value() {
+    let assertion = cargo_bin_cmd!("reach")
+        .args(["example.com", "eighty"])
+        .assert()
+        .code(2);
+    let output = assertion.get_output();
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("× TCP PORT IS NOT VALID\n"));
+    assert!(stderr.contains("must contain digits only"));
+    assert!(stderr.contains("Use a number from 1 through 65535"));
+    assert!(stderr.contains("Port               eighty"));
+}
+
+#[test]
+fn extra_arguments_get_friendly_command_guidance() {
+    let assertion = cargo_bin_cmd!("reach")
+        .args(["example.com", "443", "extra"])
+        .assert()
+        .code(2);
+    let output = assertion.get_output();
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("× COMMAND IS NOT VALID\n"));
+    assert!(stderr.contains("accepts one address and, optionally, one TCP port"));
+    assert!(stderr.contains("reach <ADDRESS> [PORT]"));
+    assert!(stderr.contains("Exit code          2"));
 }

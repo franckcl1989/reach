@@ -9,16 +9,25 @@ name = "reach"
 path = "src/main.rs"
 
 [dependencies]
+anstream.workspace = true
+anstyle.workspace = true
 clap.workspace = true
+comfy-table.workspace = true
 ctrlc.workspace = true
+humantime.workspace = true
+indicatif.workspace = true
 reach-core = { path = "../reach-core" }
 reach-platform = { path = "../reach-platform" }
+terminal_size.workspace = true
+textwrap.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+unicode-general-category.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
 send_ctrlc.workspace = true
+snapbox.workspace = true
 wait-timeout.workspace = true
 
 [lints]

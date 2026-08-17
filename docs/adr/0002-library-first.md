@@ -50,6 +50,12 @@ and target support are release gates alongside functional suitability.
 | Capability | Decision | Rationale |
 |---|---|---|
 | CLI structure | `clap` | Mature positional parsing/help; Core still owns address and port semantics. |
+| Adaptive terminal streams and style | `anstream` + `anstyle` | Rust CLI ecosystem primitives add color only when supported and strip ANSI automatically from redirected output. Reach owns only its semantic hierarchy and wording. |
+| Structured tables and width | `comfy-table` + `terminal_size` | Mature Unicode-aware table layout, content wrapping, and cross-platform terminal sizing replace handwritten column and border logic. |
+| Prose wrapping | `textwrap` | Mature Unicode-aware line breaking keeps explanations and actions readable at the detected terminal width. |
+| Transient progress | `indicatif` | Mature cross-platform TTY spinner and clearing behavior; redirected stderr remains empty. |
+| Duration presentation | `humantime` | Mature, deterministic human-readable formatting for observed durations and Attempt limits. |
+| Terminal-safe Unicode | `unicode-general-category` | Unicode category data identifies format controls such as bidirectional overrides without rejecting ordinary readable non-ASCII hostnames or OS text. |
 | IPv4/IPv6 literal | `std::net` | Standard-library strict parser. |
 | IDN + hostname | `idna` + `hostname-validator` | Mature UTS #46 preparation and RFC 1123 validation; only FQDN terminal-dot composition remains first-party. |
 | IP prefixes | `ipnet` | Mature typed prefix validation and operations. |
@@ -69,8 +75,10 @@ and target support are release gates alongside functional suitability.
 | Errors | `thiserror` | Mature typed error derivation. |
 | Property/fault testing | `proptest` | Mature generation and shrinking for untrusted input, target identity, and malformed DNS wire contracts. |
 | CLI process testing | `assert_cmd` | Mature cross-platform binary invocation and stdout/stderr/exit assertions. |
+| Output contract snapshots | `snapbox` | Mature snapshot/diff tooling protects complete plain-text error reports and presentation structure. |
 
-The 0.1.0 lockfile has no RustSec vulnerability advisory. RustSec does report
+The lockfile has no known RustSec vulnerability advisory at the recorded
+release audit. RustSec does report
 `RUSTSEC-2024-0436` as an allowed maintenance warning for `paste 1.0.15`,
 which is transitive through `netlink-packet-core`. Version 0.8.2 of that
 upstream crate deliberately reverted to `paste` and documents its judgment
