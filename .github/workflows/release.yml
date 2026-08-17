@@ -222,6 +222,9 @@ jobs:
               throw "Windows 11 $architecture invalid-input smoke must exit 2"
             }
           }
+          # The final successful assertion intentionally leaves the native exit code at 2.
+          # Return success explicitly so the GitHub pwsh wrapper does not propagate it.
+          exit 0
 
   publish:
     if: github.ref_type == 'tag'
