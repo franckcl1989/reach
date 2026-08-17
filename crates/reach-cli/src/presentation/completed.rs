@@ -195,7 +195,9 @@ fn verdict_title(completed: &CompletedDiagnostic) -> &'static str {
             }
         }
         AggregateOutcome::NoFormalTargets => match completed.hostname_resolution {
-            HostnameResolutionOutcome::DefinitiveNegative { .. } => "NAME WAS NOT FOUND",
+            HostnameResolutionOutcome::NegativeWithoutUsableAddress { .. } => {
+                "NO USABLE IP ADDRESS"
+            }
             HostnameResolutionOutcome::NonDefinitiveFailure { .. } => {
                 "NAME COULD NOT BE RESOLVED RELIABLY"
             }
@@ -313,8 +315,8 @@ fn verdict_summary(completed: &CompletedDiagnostic) -> Vec<String> {
             }
         }
         AggregateOutcome::NoFormalTargets => match &completed.hostname_resolution {
-            HostnameResolutionOutcome::DefinitiveNegative { .. } => vec![format!(
-                "System name resolution reported that {address} does not exist."
+            HostnameResolutionOutcome::NegativeWithoutUsableAddress { .. } => vec![format!(
+                "System name resolution returned no usable IPv4 or IPv6 address for {address}."
             )],
             HostnameResolutionOutcome::NonDefinitiveFailure { .. } => vec![format!(
                 "System name resolution could not produce a reliable IP address for {address}."
@@ -467,8 +469,8 @@ fn resolver_check_summary(completed: &CompletedDiagnostic) -> Option<String> {
         HostnameResolutionOutcome::SucceededWithoutUsableAddress => {
             Some("completed, but returned no usable IP address".to_owned())
         }
-        HostnameResolutionOutcome::DefinitiveNegative { .. } => {
-            Some("name does not exist".to_owned())
+        HostnameResolutionOutcome::NegativeWithoutUsableAddress { .. } => {
+            Some("returned no usable IPv4 or IPv6 address".to_owned())
         }
         HostnameResolutionOutcome::NonDefinitiveFailure { .. } => {
             Some("failed without a definitive answer".to_owned())
@@ -582,7 +584,7 @@ fn target_observation(target: &TargetDiagnostic) -> String {
         | Conclusion::PathLimitReachedWithoutEndpointEvidence
         | Conclusion::HostnameResolved
         | Conclusion::HostnameNoFormalTargets
-        | Conclusion::HostnameResolutionDefinitiveNegative
+        | Conclusion::HostnameResolutionNoUsableAddress
         | Conclusion::HostnameResolutionIndeterminate
         | Conclusion::AllTargetsSatisfied
         | Conclusion::TargetsSatisfiedWithAnomaly
@@ -639,8 +641,8 @@ fn diagnostic_note(conclusion: &Conclusion) -> &'static str {
         Conclusion::HostnameNoFormalTargets => {
             "System name resolution produced no usable destination address"
         }
-        Conclusion::HostnameResolutionDefinitiveNegative => {
-            "System name resolution reported that the hostname does not exist"
+        Conclusion::HostnameResolutionNoUsableAddress => {
+            "System name resolution returned no usable IPv4 or IPv6 address"
         }
         Conclusion::HostnameResolutionIndeterminate => {
             "System name resolution failed without a definitive answer"
@@ -696,15 +698,15 @@ fn evidence_summary(completed: &CompletedDiagnostic, evidence: &Evidence) -> Str
     }
 }
 
-fn attempt_evidence_summary(attempt: &Attempt, ordinal: usize) -> String {
-    let check = attempt_kind_label(attempt.kind);
+fn attempt_evidence_summary(attempt: &Attempt, ordinal: Option<usize>) -> String {
+    let check = attempt_display_label(attempt.kind, ordinal);
     let budget = attempt
         .timing
         .deadline_at
         .saturating_sub(attempt.timing.started_at);
     if attempt_timed_out(&attempt.outcome) {
         return format!(
-            "{check} #{ordinal}: No result before the {} deadline.",
+            "{check}: No result before the {} deadline.",
             human_duration(budget)
         );
     }
@@ -714,12 +716,15 @@ fn attempt_evidence_summary(attempt: &Attempt, ordinal: usize) -> String {
         format!(" in {}", human_duration(attempt.timing.duration()))
     };
     format!(
-        "{check} #{ordinal}: {}{timing}.",
+        "{check}: {}{timing}.",
         friendly_attempt_outcome(&attempt.outcome)
     )
 }
 
-fn find_attempt(completed: &CompletedDiagnostic, id: AttemptId) -> Option<(&Attempt, usize)> {
+fn find_attempt(
+    completed: &CompletedDiagnostic,
+    id: AttemptId,
+) -> Option<(&Attempt, Option<usize>)> {
     for target in &completed.targets {
         if let Some((index, attempt)) = target
             .attempts
@@ -727,7 +732,7 @@ fn find_attempt(completed: &CompletedDiagnostic, id: AttemptId) -> Option<(&Atte
             .enumerate()
             .find(|(_, attempt)| attempt.id == id)
         {
-            return Some((attempt, index + 1));
+            return Some((attempt, local_attempt_ordinal(&target.attempts, index)));
         }
     }
     for resolver in &completed.resolver_diagnostics {
@@ -737,10 +742,37 @@ fn find_attempt(completed: &CompletedDiagnostic, id: AttemptId) -> Option<(&Atte
             .enumerate()
             .find(|(_, attempt)| attempt.id == id)
         {
-            return Some((attempt, index + 1));
+            return Some((attempt, local_attempt_ordinal(&resolver.attempts, index)));
         }
     }
     None
+}
+
+fn local_attempt_ordinal(attempts: &[Attempt], index: usize) -> Option<usize> {
+    let kind = attempts[index].kind;
+    let count = attempts
+        .iter()
+        .filter(|attempt| attempt.kind == kind)
+        .count();
+    (count > 1).then(|| {
+        attempts[..=index]
+            .iter()
+            .filter(|attempt| attempt.kind == kind)
+            .count()
+    })
+}
+
+fn attempt_display_label(kind: AttemptKind, ordinal: Option<usize>) -> String {
+    match (kind, ordinal) {
+        (AttemptKind::TcpPath { hop_limit }, Some(ordinal)) => {
+            format!("TCP path at hop {hop_limit}, attempt #{ordinal}")
+        }
+        (AttemptKind::IcmpPath { hop_limit }, Some(ordinal)) => {
+            format!("ICMP path at hop {hop_limit}, attempt #{ordinal}")
+        }
+        (_, Some(ordinal)) => format!("{} #{ordinal}", attempt_kind_label(kind)),
+        _ => attempt_kind_label(kind),
+    }
 }
 
 fn attempt_kind_label(kind: AttemptKind) -> String {
@@ -748,12 +780,8 @@ fn attempt_kind_label(kind: AttemptKind) -> String {
         AttemptKind::TcpConnect => "TCP connect".to_owned(),
         AttemptKind::TargetIcmpEcho => "ICMP Echo".to_owned(),
         AttemptKind::NextHopIcmpEcho => "Next-hop ICMP Echo".to_owned(),
-        AttemptKind::TcpPath { hop_limit } => {
-            format!("TCP path check at hop limit {hop_limit}")
-        }
-        AttemptKind::IcmpPath { hop_limit } => {
-            format!("ICMP path check at hop limit {hop_limit}")
-        }
+        AttemptKind::TcpPath { hop_limit } => format!("TCP path at hop {hop_limit}"),
+        AttemptKind::IcmpPath { hop_limit } => format!("ICMP path at hop {hop_limit}"),
         AttemptKind::DnsUdp { query_type } => {
             format!("Direct DNS {} over UDP", dns_query_type_label(query_type))
         }
@@ -961,7 +989,7 @@ mod tests {
         assert!(output.contains("That IP address replied to ICMP Echo"));
         assert!(output.contains("TCP connect #1: No result before the 5s deadline"));
         assert!(output.contains("TCP connect #2: No result before the 5s deadline"));
-        assert!(output.contains("ICMP Echo #3: ICMP Echo Reply from 192.0.2.20"));
+        assert!(output.contains("ICMP Echo: ICMP Echo Reply from 192.0.2.20"));
         assert!(output.contains("This does not prove that the port is closed"));
         for forbidden in [
             "TECHNICAL DETAILS",
@@ -977,6 +1005,46 @@ mod tests {
                 "unexpected {forbidden:?}\n{output}"
             );
         }
+    }
+
+    #[test]
+    fn attempt_numbers_are_local_to_one_logical_operation() {
+        let mut attempts = vec![
+            attempt(
+                1,
+                AttemptKind::TcpConnect,
+                AttemptOutcome::Tcp(TcpAttemptResult::Timeout),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            ),
+            attempt(
+                2,
+                AttemptKind::TcpConnect,
+                AttemptOutcome::Tcp(TcpAttemptResult::Timeout),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            ),
+            attempt(
+                3,
+                AttemptKind::TargetIcmpEcho,
+                AttemptOutcome::Icmp(IcmpAttemptResult::Timeout),
+                Duration::from_secs(3),
+                Duration::from_secs(3),
+            ),
+        ];
+        assert_eq!(local_attempt_ordinal(&attempts, 0), Some(1));
+        assert_eq!(local_attempt_ordinal(&attempts, 1), Some(2));
+        assert_eq!(local_attempt_ordinal(&attempts, 2), None);
+
+        attempts.push(attempt(
+            4,
+            AttemptKind::TargetIcmpEcho,
+            AttemptOutcome::Icmp(IcmpAttemptResult::Timeout),
+            Duration::from_secs(3),
+            Duration::from_secs(3),
+        ));
+        assert_eq!(local_attempt_ordinal(&attempts, 2), Some(1));
+        assert_eq!(local_attempt_ordinal(&attempts, 3), Some(2));
     }
 
     #[test]
@@ -1003,7 +1071,7 @@ mod tests {
             parse_request("missing.invalid", None).expect("valid request"),
             synthetic_snapshot(),
             None,
-            HostnameResolutionOutcome::DefinitiveNegative {
+            HostnameResolutionOutcome::NegativeWithoutUsableAddress {
                 platform_code: Some(11_001),
             },
             Vec::new(),
@@ -1012,13 +1080,14 @@ mod tests {
                 id: EvidenceId(1),
                 subject: EvidenceSubject::Hostname,
                 role: EvidenceRole::PrimaryDecision,
-                fact: EvidenceFact::SystemResolverResult("definitive negative".into()),
+                fact: EvidenceFact::SystemResolverResult("negative without an address".into()),
             }],
         );
         let output = render(&negative, Theme::plain());
-        assert!(output.starts_with("× NAME WAS NOT FOUND\n"));
+        assert!(output.starts_with("× NO USABLE IP ADDRESS\n"));
         assert!(output.contains("System name resolution"));
-        assert!(output.contains("Name resolution: name does not exist"));
+        assert!(output.contains("Name resolution: returned no usable IPv4 or IPv6 address"));
+        assert!(!output.contains("does not exist"));
         assert!(!output.to_ascii_lowercase().contains("system dns"));
     }
 
@@ -1071,7 +1140,7 @@ mod tests {
             Duration::from_secs(2),
             Duration::ZERO,
         );
-        let rendered = attempt_evidence_summary(&attempt, 1);
+        let rendered = attempt_evidence_summary(&attempt, Some(1));
         assert!(rendered.contains("same observable clock reading"));
         assert!(!rendered.contains("0 ms"));
         assert!(!rendered.contains("<1"));
@@ -1086,7 +1155,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(5_016),
         );
-        let rendered = attempt_evidence_summary(&attempt, 1);
+        let rendered = attempt_evidence_summary(&attempt, Some(1));
         assert_eq!(
             rendered,
             "TCP connect #1: No result before the 5s deadline."
@@ -1269,7 +1338,7 @@ mod tests {
             Conclusion::PathLimitReachedWithoutEndpointEvidence,
             Conclusion::HostnameResolved,
             Conclusion::HostnameNoFormalTargets,
-            Conclusion::HostnameResolutionDefinitiveNegative,
+            Conclusion::HostnameResolutionNoUsableAddress,
             Conclusion::HostnameResolutionIndeterminate,
             Conclusion::AllTargetsSatisfied,
             Conclusion::TargetsSatisfiedWithAnomaly,

@@ -86,7 +86,7 @@ pub struct ResolverAddressSet {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SystemResolverFailureKind {
-    DefinitiveNoName,
+    NoUsableAddress,
     Temporary,
     Timeout,
     ResolverFailure,

@@ -195,7 +195,10 @@ fn map_platform_error(error: PlatformError) -> DiagnosticIoError {
     let kind = match error {
         PlatformError::OperationCancelled => DiagnosticIoErrorKind::Cancelled,
         PlatformError::ResourceExhausted(_) => DiagnosticIoErrorKind::ResourceExhausted,
-        PlatformError::IcmpUnavailable(_) => DiagnosticIoErrorKind::RequiredCapabilityUnavailable,
+        PlatformError::IcmpUnavailable(_)
+        | PlatformError::NameResolutionCapabilityUnavailable(_) => {
+            DiagnosticIoErrorKind::RequiredCapabilityUnavailable
+        }
         PlatformError::ClockUnavailable(_)
         | PlatformError::ResolverWorkerFailed(_)
         | PlatformError::InvalidDnsQueryName(_) => DiagnosticIoErrorKind::Internal,

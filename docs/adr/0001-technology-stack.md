@@ -70,9 +70,13 @@ classified as Timeout instead of silently granting another full Attempt budget.
 - `idna` plus `hostname-validator`: UTS #46 preparation followed by RFC 1123
   hostname validation. Reach only composes them and locks the accepted/rejected
   corpus in tests.
-- `hickory-proto`: direct DNS message encoding and decoding only. Reach owns the
-  UDP/TCP sockets, query attempts, transaction matching, timeout, retry, and
-  transport-transition state machine.
+- `hickory-proto`: direct DNS message encoding and decoding. Reach owns the
+  failure-only Direct DNS UDP/TCP sockets, query attempts, transaction matching,
+  timeout, retry, and transport-transition state machine.
+- `gai-core` plus `hickory-resolver`: Linux static-release system resolution.
+  `gai-core` parses and executes NSS source order/actions; Hickory executes only
+  a reached `dns` source with the parsed search/domain/ndots and resolver order.
+  This is separate from Direct DNS and may form formal targets.
 - Tokio networking: mature nonblocking TCP/UDP I/O. Reach owns each explicit
   Attempt, deadline, retry, and transport transition.
 - `windows-sys`: Windows IP Helper, ICMP, resolver, adapter, clock, and route
@@ -83,10 +87,12 @@ classified as Timeout instead of silently granting another full Attempt budget.
   or Neighbor surface that is not provided at ordinary-user privilege remains
   explicitly unavailable.
 
-Higher-level resolver libraries are not used for the first hostname-resolution
-path because that path must observe the normal OS resolver. They are also not
-used for direct DNS when they hide retries, resolver rotation, search suffixes,
-or transport fallback.
+macOS and Windows use the normal OS resolver for the first hostname-resolution
+path. A fully static Linux executable cannot load arbitrary glibc NSS modules,
+so it reproduces only policy paths that the selected self-contained libraries
+can faithfully execute and fails with a required-capability error for a reached
+unsupported source or option. Higher-level resolver policy remains forbidden in
+failure-only Direct DNS, where Core must retain exact Reach-owned Attempts.
 
 ## Platform mapping
 
@@ -98,7 +104,7 @@ or transport fallback.
 | Neighbor | rtnetlink neighbor messages | explicit `Unavailable`: no selected mature ordinary-user reader | `GetIpNetEntry2` |
 | TCP connect | nonblocking socket | nonblocking socket | Winsock |
 | ICMP | unprivileged datagram ICMP when available | unprivileged datagram ICMP when available | IP Helper ICMP APIs |
-| Resolver | OS `getaddrinfo` semantics | OS `getaddrinfo` semantics | OS `getaddrinfo` semantics |
+| Resolver | `gai-core` NSS policy plus `/etc/hosts` and Hickory `/etc/resolv.conf` DNS; reached unsupported policy is an execution error | OS `getaddrinfo` semantics | OS `getaddrinfo` semantics |
 | Resolver config | resolver files/APIs with provenance and limitations | SystemConfiguration dynamic store | adapter/DNS policy APIs with limitations |
 
 Every mapping reports `Available`, `Unknown`, or `Unavailable`; a missing
@@ -112,11 +118,12 @@ The dependency-first selection and exception process is defined by ADR 0002.
 
 Build and test on native GitHub-hosted runners for all six targets. Native jobs
 are required because compilation alone cannot validate ordinary-user ICMP,
-Neighbor, route, DNS transport, or cancellation capabilities. Each native job
-produces a tar containing exactly one executable; the artifact service records
-its SHA-256 digest. Linux initially targets glibc; a musl artifact may be added
-only after native capability conformance is proven and is not a substitute for
-the required Linux targets.
+Neighbor, route, DNS transport, or cancellation capabilities. Linux release
+targets are `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` and must
+pass static-ELF inspection. Windows uses target-specific `+crt-static` and must
+pass a versioned PE import allowlist. macOS must load only supported system
+paths. Every archive is extracted, hash-compared, inspected again, and executed
+before a tag release can leave draft state.
 
 ## Alternatives considered
 

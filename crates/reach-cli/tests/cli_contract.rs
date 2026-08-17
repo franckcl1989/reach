@@ -36,10 +36,10 @@ fn redirected_help_is_plain_stdout_without_progress_or_ansi() {
 }
 
 #[test]
-fn version_reports_the_0_1_2_release() {
+fn version_reports_the_0_1_3_release() {
     let assertion = cargo_bin_cmd!("reach").arg("--version").assert().code(0);
     let output = assertion.get_output();
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "reach 0.1.2\n");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "reach 0.1.3\n");
     assert!(output.stderr.is_empty());
 }
 

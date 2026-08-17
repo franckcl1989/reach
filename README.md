@@ -14,7 +14,9 @@ reach <address> [port]
 - With a port, the primary check is TCP Connect to that exact address and port.
 - Without a port, the primary check is ICMP Echo to that exact address.
 - `address` accepts a hostname, IPv4 literal, IPv6 literal, or scoped IPv6.
-- Hostnames use the normal OS resolver first. Direct DNS is failure diagnosis
+- Hostnames use the normal OS resolver path first. The static Linux build
+  executes supported host NSS `files`/`dns` policy and returns exit 2 rather
+  than skipping a reached unsupported source. Direct DNS is failure diagnosis
   only and can never create destination addresses for the primary check.
 
 Completed diagnostics go to stdout. Execution errors, cancellation, and
@@ -49,6 +51,24 @@ change an already-completed primary check.
 See `docs/0.1.0-native-capability-matrix.md` for the exact platform matrix and
 native release status.
 
+## Release portability
+
+Linux release executables are fully static musl ELF files. Windows release
+executables use static CRT and import only an audited Windows system-DLL
+allowlist. macOS executables may load only supported `/System/Library` and
+`/usr/lib` components. Each release archive contains exactly one executable.
+
+The 0.1.3 tested support floors are Linux kernel 6.8 on x86-64/ARM64 (plus
+Rocky Linux 8 and 9 user-space smoke), Windows 11 client on x86-64/ARM64,
+Windows Server 2022 on x86-64, macOS 15 on x86-64, and macOS 14 on ARM64.
+Windows ARM64 Server and versions below these floors are unsupported. Exact
+runner versions and artifact checks are recorded in the release evidence.
+
+The current release is unsigned: Authenticode, Apple Developer ID/notarization,
+and a Linux detached signature are not configured. SHA-256 checksums and build
+provenance are published, but operating systems may still display trust
+warnings.
+
 ## Build and verify
 
 Build with the current stable Rust toolchain. The project does not pin a Rust
@@ -62,14 +82,18 @@ cargo test --workspace --all-targets --locked
 ```
 
 The six-target native GitHub Actions matrix is the release gate. Every release
-job runs the ordinary-user conformance suite, builds and executes the native
-binary, and produces one archive containing exactly one `reach` executable.
+job runs the ordinary-user conformance suite under the final target/linkage
+configuration, inspects the executable dependency table before and after
+packaging, verifies archive/executable hashes, and executes the extracted
+artifact. Release artifact names derive from the Cargo workspace version.
 The successful 0.1.0 native capability evidence is recorded in
 `docs/0.1.0-native-capability-matrix.md`; the 0.1.1 output, test, CI, and
 artifact evidence is historical in `docs/0.1.1-release-evidence.md`. The
-0.1.2 release evidence is attached directly to the GitHub Release so no
-post-gate documentation commit can separate the tag from the tested artifact
-source.
+0.1.2 release evidence remains attached to its historical GitHub Release.
+Version 0.1.3's closure contract is in
+`docs/0.1.3-baseline-closure.md`; run-specific evidence is attached to the
+0.1.3 Release so no post-gate commit can separate the tag from the tested
+artifact source.
 
 ## Architecture and dependency policy
 

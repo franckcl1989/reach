@@ -49,7 +49,7 @@ pub enum Conclusion {
     PathLimitReachedWithoutEndpointEvidence,
     HostnameResolved,
     HostnameNoFormalTargets,
-    HostnameResolutionDefinitiveNegative,
+    HostnameResolutionNoUsableAddress,
     HostnameResolutionIndeterminate,
     AllTargetsSatisfied,
     TargetsSatisfiedWithAnomaly,
@@ -240,7 +240,7 @@ pub enum HostnameResolutionOutcome {
     NotRequested,
     Succeeded(ResolverAddressSet),
     SucceededWithoutUsableAddress,
-    DefinitiveNegative {
+    NegativeWithoutUsableAddress {
         platform_code: Option<i32>,
     },
     NonDefinitiveFailure {
@@ -256,7 +256,7 @@ impl HostnameResolutionOutcome {
             Self::NotRequested => true,
             Self::Succeeded(addresses) => !addresses.formal_targets.is_empty(),
             Self::SucceededWithoutUsableAddress
-            | Self::DefinitiveNegative { .. }
+            | Self::NegativeWithoutUsableAddress { .. }
             | Self::NonDefinitiveFailure { .. } => false,
         }
     }
@@ -307,8 +307,8 @@ impl CompletedDiagnostic {
             AggregateOutcome::Mixed => Conclusion::TargetResultsMixed,
             AggregateOutcome::NoneCleanlySatisfied => Conclusion::NoTargetCleanlySatisfied,
             AggregateOutcome::NoFormalTargets => match &hostname_resolution {
-                HostnameResolutionOutcome::DefinitiveNegative { .. } => {
-                    Conclusion::HostnameResolutionDefinitiveNegative
+                HostnameResolutionOutcome::NegativeWithoutUsableAddress { .. } => {
+                    Conclusion::HostnameResolutionNoUsableAddress
                 }
                 HostnameResolutionOutcome::NonDefinitiveFailure { .. } => {
                     Conclusion::HostnameResolutionIndeterminate

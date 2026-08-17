@@ -60,11 +60,18 @@ abc <address> <port>
 
 ### 3.2 发布要求
 
-- 单一可执行文件交付；
-- 尽量不依赖额外运行时；
-- 不随包携带非必要动态库；
+- 每个平台/架构的 release archive 只包含一个可执行文件；
+- Linux release 必须是完全自包含的静态 musl ELF，不得包含 `PT_INTERP`、
+  `DT_NEEDED`、`RPATH`/`RUNPATH` 或 `GLIBC_*` 版本需求；
+- Windows release 必须静态链接 Reach 使用的 C/C++ runtime，不得导入
+  `VCRUNTIME*`、`MSVCP*`、`api-ms-win-crt-*` 或第三方应用 DLL；
+- macOS release 可以依赖受支持的 `/System/Library` 与 `/usr/lib` 系统组件，
+  但不得依赖 Homebrew、MacPorts、第三方 dylib/framework 或相对 runtime 路径；
 - 不要求系统安装 `ping`、`traceroute`、`nc`、`telnet` 等命令；
 - 不对 macOS / Windows 作不现实的“操作系统层面绝对纯静态链接”承诺，但产品自身不得依赖额外应用运行时才能启动。
+
+上述合同以 archive 内实际 executable 的依赖表、hash、解包后执行和最低支持环境
+实测共同裁决；仅有编译参数或 archive 文件数量不构成证明。
 
 ### 3.3 明确不做
 
@@ -479,6 +486,15 @@ Neighbor 事实不得与 route fact 混为同一对象。
 - 用初始 DNS 配置构造替代 resolver。
 
 平台适配层应使用 OS 正常地址解析 API 请求 IPv4/IPv6 地址集合，不得由产品自行强制只解析某一个地址族，也不得在 Core 外私自重排结果。具体 API 可以不同，但“让 OS 正常 resolver 产生地址结果”的语义必须一致。
+
+Linux 静态 release 是这一规则的明确平台实现边界：静态 musl 的
+`getaddrinfo` 不得冒充宿主 glibc 的任意 NSS。Linux 适配层必须先读取并按顺序
+执行宿主 `/etc/nsswitch.conf` 的 `hosts:` 策略，并使用 `/etc/hosts` 与
+`/etc/resolv.conf` 完成当前实现能够忠实支持的 `files`/`dns` 路径。执行路径上
+出现无法忠实执行的 source、action 或 resolver 选项时，必须以 Required
+Capability Unavailable / ExecutionError(2) 结束；不得跳过该 source、猜测目标或
+把 failure-only Direct DNS 提升为正式目标。若前置受支持 source 已按 NSS 策略
+终止，后续未执行 source 不造成无意义失败。
 
 ### 9.2 系统 resolver 的时间语义
 
@@ -1209,6 +1225,13 @@ Core 结论必须确定性：
 5. 不影响结论的成功准备步骤、冗余 Attempt 和完整内部过程默认不进入 Key Evidence；
 6. 多目标场景先保持各目标独立关键证据，再由 hostname 层只选择解释整体差异所需的最小集合。
 
+系统名称解析成功且已形成正式目标时，该解析事实是后续目标诊断的 Context，
+不得作为 PrimaryDecision 抢占真正决定网络检查结果的 Attempt。只有解析失败、
+negative/no-usable-address、zero-target 或 Required Capability Unavailable 本身决定
+顶层结果时，解析事实才可成为对应角色的关键证据。平台 negative/no-address
+事实不得升级成“hostname 在所有环境中不存在”；Direct DNS 的 NXDOMAIN 也只属于
+该次协议响应。
+
 OS 返回的事实还必须区分“语义有序”和“仅枚举有序”：resolver 地址返回顺序、明确配置优先级等有协议/OS 语义的顺序必须保留；interface、route、Neighbor 等没有语义保证的枚举顺序不得影响结论或 Key Evidence，必须按身份/优先级事实进行规范化或按集合处理。
 
 不得使用：
@@ -1237,6 +1260,11 @@ OS 返回的事实还必须区分“语义有序”和“仅枚举有序”：re
 成功且没有异常的路径应尤其简洁。
 
 CLI 不自行判断哪些底层事实重要，关键证据由 Core 产生。
+
+默认展示 Attempt 时不得泄漏全局 `AttemptId` 或目标历史 vector 位置。编号只在
+同一逻辑操作确有多次 Attempt 时显示，并从 1 局部计数；例如两次 TCP 后的一次
+ICMP 显示为 `TCP connect #1`、`TCP connect #2`、`ICMP Echo`。Path Attempt 使用
+hop 加该 hop 内的局部 attempt 编号。内部事实模型继续完整保留全局 Attempt identity。
 
 ### 21.2 stdout / stderr
 
@@ -1651,7 +1679,7 @@ If hostname:
   -> SystemResolve
       -> SuccessWithAddresses: BuildOrderedUniqueTargets
       -> SuccessWithoutUsableAddress: HostnameDiagnosticNonSuccess
-      -> DefinitiveNegative: FinishHostnameFailure
+      -> NegativeWithoutUsableAddress: FinishHostnameFailure
       -> NonDefinitiveFailure: DiagnoseResolverDependency
 
 For each formal target (max concurrency 4):

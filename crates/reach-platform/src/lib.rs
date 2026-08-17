@@ -41,6 +41,8 @@ pub enum PlatformError {
     OperationCancelled,
     #[error("the system resolver worker failed: {0}")]
     ResolverWorkerFailed(String),
+    #[error("the required Linux name-resolution capability is unavailable: {0}")]
+    NameResolutionCapabilityUnavailable(String),
     #[error("the DNS query name cannot be encoded: {0}")]
     InvalidDnsQueryName(String),
     #[error("the ordinary-user ICMP facility is unavailable: {0}")]

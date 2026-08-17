@@ -83,11 +83,11 @@ pub async fn run_diagnostic(
                         evidence,
                     ),
                     SystemResolverResult::Failed(failure)
-                        if failure.kind == SystemResolverFailureKind::DefinitiveNoName =>
+                        if failure.kind == SystemResolverFailureKind::NoUsableAddress =>
                     {
                         (
                             Some(observation.clone()),
-                            HostnameResolutionOutcome::DefinitiveNegative {
+                            HostnameResolutionOutcome::NegativeWithoutUsableAddress {
                                 platform_code: failure.platform_code,
                             },
                             Vec::new(),
@@ -2195,7 +2195,14 @@ fn system_resolver_evidence(observation: &SystemResolverObservation) -> Evidence
     Evidence {
         id: EvidenceId(1),
         subject: EvidenceSubject::Hostname,
-        role: EvidenceRole::PrimaryDecision,
+        role: match &observation.result {
+            SystemResolverResult::Succeeded(addresses) if !addresses.formal_targets.is_empty() => {
+                EvidenceRole::Context
+            }
+            SystemResolverResult::Succeeded(_) | SystemResolverResult::Failed(_) => {
+                EvidenceRole::PrimaryDecision
+            }
+        },
         fact: EvidenceFact::SystemResolverResult(summary),
     }
 }
@@ -2978,7 +2985,7 @@ mod tests {
             started_at: Duration::ZERO,
             completed_at: Duration::from_millis(1),
             result: SystemResolverResult::Failed(SystemResolverFailure {
-                kind: SystemResolverFailureKind::DefinitiveNoName,
+                kind: SystemResolverFailureKind::NoUsableAddress,
                 platform_code: Some(1),
                 platform_message: "synthetic no name".into(),
             }),
@@ -3002,6 +3009,25 @@ mod tests {
             result: SystemResolverResult::Succeeded(ResolverAddressSet::from_raw(targets)),
             provenance: provenance(),
         }
+    }
+
+    #[test]
+    fn successful_resolver_with_formal_targets_is_context_not_primary_decision() {
+        let successful = resolver_success(vec![TargetIp::v4(Ipv4Addr::new(192, 0, 2, 20))]);
+        assert_eq!(
+            system_resolver_evidence(&successful).role,
+            EvidenceRole::Context
+        );
+
+        let empty = resolver_success(Vec::new());
+        assert_eq!(
+            system_resolver_evidence(&empty).role,
+            EvidenceRole::PrimaryDecision
+        );
+        assert_eq!(
+            system_resolver_evidence(&resolver_failure()).role,
+            EvidenceRole::PrimaryDecision
+        );
     }
 
     fn icmp_message(kind: IcmpMessageKind, responder: Ipv4Addr) -> IcmpAttemptResult {
@@ -3429,7 +3455,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn definitive_negative_and_zero_address_resolution_never_probe_or_succeed() {
+    async fn negative_and_zero_address_resolution_never_probe_or_succeed() {
         let definitive_io =
             ScriptedIo::new(with_dns_resolver(snapshot(Some(RouteBehavior::Unicast))))
                 .with_resolver(definitive_resolver_failure());
@@ -3443,7 +3469,7 @@ mod tests {
         );
         assert_eq!(
             definitive.conclusion,
-            Conclusion::HostnameResolutionDefinitiveNegative
+            Conclusion::HostnameResolutionNoUsableAddress
         );
         assert!(definitive.resolver_diagnostics.is_empty());
         assert_eq!(
