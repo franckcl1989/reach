@@ -1,0 +1,20 @@
+[package]
+name = "reach-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+futures-util.workspace = true
+hostname-validator.workspace = true
+idna.workspace = true
+ipnet.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

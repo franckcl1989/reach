@@ -1,0 +1,25 @@
+[package]
+name = "reach-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "reach"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+ctrlc.workspace = true
+reach-core = { path = "../reach-core" }
+reach-platform = { path = "../reach-platform" }
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+send_ctrlc.workspace = true
+wait-timeout.workspace = true
+
+[lints]
+workspace = true
