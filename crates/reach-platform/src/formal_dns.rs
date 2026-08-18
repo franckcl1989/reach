@@ -401,8 +401,10 @@ mod tests {
 
     struct ServerScript {
         requests: Arc<Mutex<Vec<(String, RecordType)>>>,
-        responder: Box<dyn Fn(&Message) -> Option<Message> + Send + Sync>,
+        responder: Responder,
     }
+
+    type Responder = Box<dyn Fn(&Message) -> Option<Message> + Send + Sync>;
 
     async fn serve(script: Arc<ServerScript>, receive_limit: usize) -> std::net::SocketAddrV4 {
         let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -427,14 +429,13 @@ mod tests {
                     .lock()
                     .expect("request log")
                     .push((question.name().to_string(), question.query_type()));
-                if let Some(response) = (script.responder)(&query) {
-                    if socket
+                if let Some(response) = (script.responder)(&query)
+                    && socket
                         .send_to(&response.to_vec().expect("encode DNS response"), peer)
                         .await
                         .is_err()
-                    {
-                        return;
-                    }
+                {
+                    return;
                 }
             }
         });
