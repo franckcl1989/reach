@@ -2,11 +2,12 @@ use std::fmt::Write as _;
 
 use reach_core::{
     Cancelled, CapabilityReason, DnsExchangeEvidence, EvidenceFact, ExecutionError,
-    ExecutionErrorKind, InputError, NameResolutionEvidenceOutcome, NeighborObservation,
-    NeighborState,
+    ExecutionErrorKind, InputError, NeighborObservation, NeighborState,
 };
 
-use super::{Theme, bullets, field, headline, paragraph, section, terminal_escape};
+use super::{
+    Theme, bullets, field, headline, name_resolution, paragraph, section, terminal_escape,
+};
 
 pub(super) fn render_execution(error: &ExecutionError, theme: Theme) -> String {
     let mut output = String::new();
@@ -56,19 +57,19 @@ pub(super) fn render_execution(error: &ExecutionError, theme: Theme) -> String {
             }
             EvidenceFact::NameResolution(evidence) => format!(
                 "System name resolution: {}",
-                name_resolution_outcome(evidence.outcome)
+                name_resolution::name_resolution_outcome_label(evidence.outcome)
             ),
             EvidenceFact::DnsExchange(DnsExchangeEvidence::Formal(exchange)) => {
                 format!(
                     "Formal DNS {} exchange with {}: {}",
-                    dns_query_type(exchange.query_type),
+                    name_resolution::dns_query_type_label(exchange.query_type),
                     exchange.endpoint.address,
                     terminal_escape(&exchange.query_name)
                 )
             }
             EvidenceFact::DnsExchange(DnsExchangeEvidence::Diagnostic(id)) => {
                 format!(
-                    "Direct DNS diagnostic attempt A{} completed before the error",
+                    "Direct DNS diagnostic attempt {} completed before the error",
                     id.0
                 )
             }
@@ -101,26 +102,6 @@ fn neighbor_observation(value: NeighborObservation) -> &'static str {
         NeighborObservation::Observed(state) => neighbor_state(state),
         NeighborObservation::Unknown => "unknown",
         NeighborObservation::Unavailable => "unavailable",
-    }
-}
-
-fn name_resolution_outcome(value: NameResolutionEvidenceOutcome) -> &'static str {
-    match value {
-        NameResolutionEvidenceOutcome::Succeeded { .. } => "completed with usable addresses",
-        NameResolutionEvidenceOutcome::SucceededWithoutUsableAddress => {
-            "completed without a usable IP address"
-        }
-        NameResolutionEvidenceOutcome::NegativeWithoutUsableAddress => {
-            "returned no usable IPv4 or IPv6 address"
-        }
-        NameResolutionEvidenceOutcome::NonDefinitiveFailure => "failed without a definitive answer",
-    }
-}
-
-const fn dns_query_type(value: reach_core::DnsQueryType) -> &'static str {
-    match value {
-        reach_core::DnsQueryType::A => "A",
-        reach_core::DnsQueryType::Aaaa => "AAAA",
     }
 }
 

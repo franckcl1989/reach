@@ -6,9 +6,9 @@ use comfy_table::{
 use reach_core::{
     AggregateOutcome, Attempt, AttemptId, AttemptKind, AttemptOutcome, CapabilityReason,
     CompletedDiagnostic, Conclusion, DnsAttemptResult, DnsExchangeEvidence, DnsQueryType, Evidence,
-    EvidenceFact, HostnameResolutionOutcome, IcmpAttemptResult, IcmpMessageKind,
-    NameResolutionEvidenceOutcome, NameResolutionSource, NeighborObservation, NeighborState,
-    PrimaryOutcome, TargetDiagnostic, TargetIp, TcpAttemptResult,
+    EvidenceFact, EvidenceSubject, HostnameResolutionOutcome, IcmpAttemptResult, IcmpMessageKind,
+    NameResolutionSource, NeighborObservation, NeighborState, PrimaryOutcome, TargetDiagnostic,
+    TargetIp, TcpAttemptResult,
 };
 
 use super::{
@@ -100,14 +100,7 @@ fn formal_dns_servers(completed: &CompletedDiagnostic) -> Option<Vec<String>> {
     if exchanges.is_empty() {
         return None;
     }
-    let mut servers = Vec::new();
-    for exchange in &exchanges {
-        let endpoint = format!("{}:{}", exchange.endpoint.address, exchange.endpoint.port);
-        if !servers.contains(&endpoint) {
-            servers.push(endpoint);
-        }
-    }
-    Some(servers)
+    Some(name_resolution::distinct_endpoints(exchanges.iter()))
 }
 
 fn render_targets(output: &mut String, completed: &CompletedDiagnostic, theme: Theme) {
@@ -190,20 +183,12 @@ fn render_key_evidence(output: &mut String, completed: &CompletedDiagnostic, the
     {
         return;
     }
-    let mut values = Vec::new();
-    for evidence in completed
+    let values = completed
         .key_evidence
         .iter()
         .filter(|evidence| name_resolution::evidence_is_distinct(completed, &evidence.fact))
-    {
-        let summary = evidence_summary(completed, evidence);
-        // Core keeps every evidence item; identical adjacent summaries (for
-        // example one capability limitation per configured resolver
-        // candidate) collapse into one line instead of a visual wall.
-        if values.last() != Some(&summary) {
-            values.push(summary);
-        }
-    }
+        .map(|evidence| evidence_summary(completed, evidence))
+        .collect::<Vec<_>>();
     if values.is_empty() {
         return;
     }
@@ -753,16 +738,13 @@ fn evidence_summary(completed: &CompletedDiagnostic, evidence: &Evidence) -> Str
         EvidenceFact::NameResolution(value) => {
             format!(
                 "Name resolution: {}.",
-                name_resolution_outcome_label(value.outcome)
+                name_resolution::name_resolution_outcome_label(value.outcome)
             )
         }
         EvidenceFact::DnsExchange(DnsExchangeEvidence::Formal(exchange)) => {
-            let query_type = match exchange.query_type {
-                DnsQueryType::A => "A",
-                DnsQueryType::Aaaa => "AAAA",
-            };
             format!(
-                "Formal DNS {query_type} exchange with {} for {}: {}.",
+                "Formal DNS {} exchange with {} for {}: {}.",
+                name_resolution::dns_query_type_label(exchange.query_type),
                 exchange.endpoint.address,
                 terminal_escape(&exchange.query_name),
                 name_resolution::formal_exchange_summary(exchange),
@@ -777,11 +759,19 @@ fn evidence_summary(completed: &CompletedDiagnostic, evidence: &Evidence) -> Str
                 |(attempt, ordinal)| attempt_evidence_summary(attempt, ordinal),
             )
         }
-        EvidenceFact::CapabilityUnavailable { capability, reason } => format!(
-            "{} unavailable: {}.",
-            terminal_escape(capability),
-            capability_reason(reason)
-        ),
+        EvidenceFact::CapabilityUnavailable { capability, reason } => {
+            let subject = match &evidence.subject {
+                EvidenceSubject::Resolver(label) => {
+                    format!("Resolver {}: ", terminal_escape(label))
+                }
+                _ => String::new(),
+            };
+            format!(
+                "{subject}{} unavailable: {}.",
+                terminal_escape(capability),
+                capability_reason(reason)
+            )
+        }
         EvidenceFact::SnapshotInconsistency(value) => format!(
             "Snapshot cross-check found an inconsistency: {}.",
             terminal_escape(value)
@@ -789,19 +779,6 @@ fn evidence_summary(completed: &CompletedDiagnostic, evidence: &Evidence) -> Str
         EvidenceFact::SocketPathComparison(value) => {
             format!("Targeted OS path comparison: {}.", terminal_escape(value))
         }
-    }
-}
-
-fn name_resolution_outcome_label(value: NameResolutionEvidenceOutcome) -> &'static str {
-    match value {
-        NameResolutionEvidenceOutcome::Succeeded { .. } => "succeeded with usable addresses",
-        NameResolutionEvidenceOutcome::SucceededWithoutUsableAddress => {
-            "completed, but returned no usable IP address"
-        }
-        NameResolutionEvidenceOutcome::NegativeWithoutUsableAddress => {
-            "returned no usable IPv4 or IPv6 address"
-        }
-        NameResolutionEvidenceOutcome::NonDefinitiveFailure => "failed without a definitive answer",
     }
 }
 
@@ -822,10 +799,7 @@ fn attempt_evidence_summary(attempt: &Attempt, ordinal: Option<usize>) -> String
     } else {
         format!(" in {}", human_duration(attempt.timing.duration()))
     };
-    format!(
-        "{check}: {}{timing}.",
-        friendly_attempt_outcome(&attempt.outcome)
-    )
+    format!("{check}: {}{timing}.", friendly_attempt_outcome(attempt))
 }
 
 fn find_attempt(
@@ -890,10 +864,16 @@ fn attempt_kind_label(kind: AttemptKind) -> String {
         AttemptKind::TcpPath { hop_limit } => format!("TCP path at hop {hop_limit}"),
         AttemptKind::IcmpPath { hop_limit } => format!("ICMP path at hop {hop_limit}"),
         AttemptKind::DnsUdp { query_type } => {
-            format!("Direct DNS {} over UDP", dns_query_type_label(query_type))
+            format!(
+                "Direct DNS {} over UDP",
+                name_resolution::dns_query_type_label(query_type)
+            )
         }
         AttemptKind::DnsTcp { query_type } => {
-            format!("Direct DNS {} over TCP", dns_query_type_label(query_type))
+            format!(
+                "Direct DNS {} over TCP",
+                name_resolution::dns_query_type_label(query_type)
+            )
         }
     }
 }
@@ -907,8 +887,8 @@ fn attempt_timed_out(outcome: &AttemptOutcome) -> bool {
     )
 }
 
-fn friendly_attempt_outcome(outcome: &AttemptOutcome) -> String {
-    match outcome {
+fn friendly_attempt_outcome(attempt: &Attempt) -> String {
+    match &attempt.outcome {
         AttemptOutcome::Tcp(result) => tcp_outcome_label(result),
         AttemptOutcome::Icmp(IcmpAttemptResult::Message {
             kind, responder, ..
@@ -931,7 +911,7 @@ fn friendly_attempt_outcome(outcome: &AttemptOutcome) -> String {
         AttemptOutcome::Icmp(IcmpAttemptResult::Timeout) => {
             "no ICMP response before the deadline".to_owned()
         }
-        AttemptOutcome::Dns(result) => dns_outcome_label(result),
+        AttemptOutcome::Dns(result) => dns_outcome_label(result, attempt),
     }
 }
 
@@ -960,25 +940,24 @@ fn tcp_outcome_label(result: &TcpAttemptResult) -> String {
     }
 }
 
-fn dns_outcome_label(result: &DnsAttemptResult) -> String {
+fn dns_outcome_label(result: &DnsAttemptResult, attempt: &Attempt) -> String {
+    let query_type = match attempt.kind {
+        AttemptKind::DnsUdp { query_type } | AttemptKind::DnsTcp { query_type } => query_type,
+        _ => DnsQueryType::A,
+    };
     match result {
         DnsAttemptResult::Response {
             response_code,
             addresses,
             aliases,
             truncated,
-        } => {
-            let mut label = name_resolution::dns_attempt_response_label(
-                *response_code,
-                addresses,
-                *truncated,
-                DnsQueryType::A,
-            );
-            if !aliases.is_empty() {
-                let _ = write!(label, "; {}", counted(aliases.len(), "alias", "aliases"));
-            }
-            label
-        }
+        } => name_resolution::dns_attempt_response_label(
+            reach_core::DnsResponseCode::from(*response_code),
+            addresses,
+            aliases,
+            *truncated,
+            query_type,
+        ),
         DnsAttemptResult::TransportError { os_code } => format!(
             "Transport error{}",
             os_code.map_or_else(String::new, |code| format!(" (OS code {code})"))
@@ -1056,13 +1035,6 @@ fn counted(count: usize, singular: &str, plural: &str) -> String {
         format!("1 {singular}")
     } else {
         format!("{count} {plural}")
-    }
-}
-
-const fn dns_query_type_label(value: DnsQueryType) -> &'static str {
-    match value {
-        DnsQueryType::A => "A",
-        DnsQueryType::Aaaa => "AAAA",
     }
 }
 
@@ -1454,42 +1426,96 @@ mod tests {
 
     #[test]
     fn dns_response_codes_render_symbolically_and_unknown_codes_stay_numbered() {
+        use reach_core::DnsResponseCode;
         assert_eq!(
-            name_resolution::dns_attempt_response_label(3, &[], false, DnsQueryType::A),
+            name_resolution::dns_attempt_response_label(
+                DnsResponseCode::NxDomain,
+                &[],
+                &[],
+                false,
+                DnsQueryType::A
+            ),
             "NXDOMAIN"
         );
         assert_eq!(
-            name_resolution::dns_attempt_response_label(2, &[], false, DnsQueryType::Aaaa),
+            name_resolution::dns_attempt_response_label(
+                DnsResponseCode::ServFail,
+                &[],
+                &[],
+                false,
+                DnsQueryType::Aaaa
+            ),
             "SERVFAIL"
         );
         assert_eq!(
-            name_resolution::dns_attempt_response_label(5, &[], false, DnsQueryType::A),
+            name_resolution::dns_attempt_response_label(
+                DnsResponseCode::Refused,
+                &[],
+                &[],
+                false,
+                DnsQueryType::A
+            ),
             "REFUSED"
         );
         assert_eq!(
-            name_resolution::dns_attempt_response_label(0, &[], false, DnsQueryType::A),
+            name_resolution::dns_attempt_response_label(
+                DnsResponseCode::NoError,
+                &[],
+                &[],
+                false,
+                DnsQueryType::A
+            ),
             "No A address returned"
         );
         assert_eq!(
-            name_resolution::dns_attempt_response_label(0, &[], false, DnsQueryType::Aaaa),
+            name_resolution::dns_attempt_response_label(
+                DnsResponseCode::NoError,
+                &[],
+                &[],
+                false,
+                DnsQueryType::Aaaa
+            ),
             "No AAAA address returned"
         );
         assert_eq!(
-            name_resolution::dns_attempt_response_label(0, &[], true, DnsQueryType::A),
+            name_resolution::dns_attempt_response_label(
+                DnsResponseCode::NoError,
+                &[],
+                &[],
+                true,
+                DnsQueryType::A
+            ),
             "Response truncated"
         );
         assert_eq!(
-            name_resolution::dns_attempt_response_label(12, &[], false, DnsQueryType::A),
+            name_resolution::dns_attempt_response_label(
+                DnsResponseCode::Other(12),
+                &[],
+                &[],
+                false,
+                DnsQueryType::A
+            ),
             "DNS response code 12"
         );
         assert_eq!(
             name_resolution::dns_attempt_response_label(
-                0,
+                DnsResponseCode::NoError,
                 &[Ipv4Addr::new(192, 0, 2, 1).into()],
+                &[],
                 false,
                 DnsQueryType::A
             ),
             "192.0.2.1"
+        );
+        assert_eq!(
+            name_resolution::dns_attempt_response_label(
+                DnsResponseCode::NoError,
+                &[Ipv4Addr::new(192, 0, 2, 1).into()],
+                &["cdn.example".to_owned()],
+                false,
+                DnsQueryType::A
+            ),
+            "192.0.2.1 (alias: cdn.example)"
         );
     }
 
@@ -1709,7 +1735,19 @@ mod tests {
             raw_code: None,
             native_status: Some(IcmpNativeStatus::WindowsIpHelper(0)),
         });
-        let rendered = friendly_attempt_outcome(&outcome);
+        let test_attempt = Attempt {
+            id: AttemptId(1),
+            subject: reach_core::AttemptSubject::Target(TargetIp::v4(Ipv4Addr::LOCALHOST)),
+            kind: AttemptKind::TargetIcmpEcho,
+            timing: reach_core::AttemptTiming {
+                started_at: Duration::ZERO,
+                deadline_at: Duration::from_secs(2),
+                completed_at: Duration::ZERO,
+            },
+            outcome,
+            provenance: provenance(),
+        };
+        let rendered = friendly_attempt_outcome(&test_attempt);
         assert_eq!(rendered, "Reply from 127.0.0.1");
         assert!(!rendered.contains("raw"));
         assert!(!rendered.contains("status"));

@@ -1347,7 +1347,7 @@ NAME RESOLUTION
 - `NAME RESOLUTION` 展示正式解析事实：source、实际 DNS endpoint（仅可证实时）、精确 query name（仅可观测时；输入与 query 不同时同时显示 `Input`/`Query`）、A/AAAA 独立摘要行；
 - 系统 resolver 不透明时显示 `Formal DNS server: Not exposed by this platform`，配置候选与诊断端点都必须单独标注，不得冒充实标；
 - 确实运行了 Reach 自发的诊断 DNS 时才有 `DNS DIAGNOSTIC` 区，并在 `WHAT THIS MEANS` 中说明其仅为失败诊断、未用作目标地址；没有运行时该说明必须完全省略；
-- 默认 `EVIDENCE` 不得重复 `NAME RESOLUTION` / `DNS DIAGNOSTIC` 已完整表达的事实；能力边界类证据除外；
+- 默认 `EVIDENCE` 不得重复 `NAME RESOLUTION` / `DNS DIAGNOSTIC` 已完整表达的事实；能力边界类证据除外；针对具体 resolver 候选的能力边界证据必须带出该候选的 endpoint 身份，渲染层不得把不同候选合并成一条无主体的重复行；
 - 成功路径保持简洁：可证实时在 CHECK 中追加一行 `DNS server`，hosts 命中时使用 `Name source: hosts`，不得凭空出现 DNS server 字段；IP literal 输出不得出现名称解析区；
 - 时长统一使用带空格的单位（`5 s`、`16 ms`、`1.2 s`），DNS/TCP/ICMP 共用同一格式化函数；
 - ICMP 证据措辞避免冗余，如 `ICMP Echo: Reply from 10.30.9.252 in 16 ms.`。

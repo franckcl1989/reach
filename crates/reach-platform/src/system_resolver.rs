@@ -288,14 +288,9 @@ fn linux_lookup_with_paths_and_dns_port(
                 .collect(),
         ))
     };
-    let steps = source_resolver
-        .steps
-        .into_iter()
-        .map(|recorded| recorded.step)
-        .collect();
     Ok(NameResolutionObservation {
         input_name: hostname.to_owned(),
-        steps,
+        steps: source_resolver.steps,
         limitations: Vec::new(),
         result,
     })
@@ -304,11 +299,6 @@ fn linux_lookup_with_paths_and_dns_port(
 #[cfg(target_os = "linux")]
 fn capability_error(message: impl std::fmt::Display) -> ResolverWorkerError {
     ResolverWorkerError::CapabilityUnavailable(message.to_string())
-}
-
-#[cfg(target_os = "linux")]
-struct RecordedStep {
-    step: NameResolutionStep,
 }
 
 #[cfg(target_os = "linux")]
@@ -323,7 +313,7 @@ struct LinuxSourceResolver<'a> {
     runtime: Option<tokio::runtime::Runtime>,
     dns_config: Option<FormalDnsConfig>,
     dns_port_override: Option<u16>,
-    steps: Vec<RecordedStep>,
+    steps: Vec<NameResolutionStep>,
 }
 
 #[cfg(target_os = "linux")]
@@ -364,15 +354,13 @@ impl<'a> LinuxSourceResolver<'a> {
         exchanges: Vec<reach_core::DnsExchangeObservation>,
         outcome: NameResolutionStepOutcome,
     ) {
-        self.steps.push(RecordedStep {
-            step: NameResolutionStep {
-                source,
-                query_names,
-                dns_exchanges: exchanges,
-                outcome,
-                provenance: Provenance::new(ProvenanceSource::SystemResolver)
-                    .with_detail("executed Linux NSS hosts-policy step"),
-            },
+        self.steps.push(NameResolutionStep {
+            source,
+            query_names,
+            dns_exchanges: exchanges,
+            outcome,
+            provenance: Provenance::new(ProvenanceSource::SystemResolver)
+                .with_detail("executed Linux NSS hosts-policy step"),
         });
     }
 
@@ -456,6 +444,7 @@ impl<'a> LinuxSourceResolver<'a> {
             ndots: parsed.ndots,
             timeout: std::time::Duration::from_secs(u64::from(timeout)),
             attempts,
+            ipv6_first: parsed.inet6,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

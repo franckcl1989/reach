@@ -214,7 +214,7 @@ pub(super) fn evidence_is_distinct(
     }
 }
 
-fn distinct_endpoints<'a>(
+pub(super) fn distinct_endpoints<'a>(
     exchanges: impl Iterator<Item = &'a DnsExchangeObservation>,
 ) -> Vec<String> {
     let mut endpoints = Vec::new();
@@ -254,6 +254,20 @@ pub(super) fn formal_exchange_summary(exchange: &DnsExchangeObservation) -> Stri
     attach_timing(outcome, exchange.timing.duration())
 }
 
+fn exchange_outcome_label(outcome: &DnsExchangeOutcome, query_type: DnsQueryType) -> String {
+    match outcome {
+        DnsExchangeOutcome::Response {
+            response_code,
+            addresses,
+            aliases,
+            truncated,
+        } => dns_attempt_response_label(*response_code, addresses, aliases, *truncated, query_type),
+        DnsExchangeOutcome::TransportError { .. } => "Transport error".to_owned(),
+        DnsExchangeOutcome::ProtocolError => "Protocol error".to_owned(),
+        DnsExchangeOutcome::Timeout => "Timed out".to_owned(),
+    }
+}
+
 fn diagnostic_attempt_summary(attempt: &Attempt) -> String {
     let AttemptOutcome::Dns(outcome) = &attempt.outcome else {
         return "Unexpected attempt type".to_owned();
@@ -267,9 +281,15 @@ fn diagnostic_attempt_summary(attempt: &Attempt) -> String {
         DnsAttemptResult::Response {
             response_code,
             addresses,
+            aliases,
             truncated,
-            ..
-        } => dns_attempt_response_label(*response_code, addresses, *truncated, query_type),
+        } => dns_attempt_response_label(
+            DnsResponseCode::from(*response_code),
+            addresses,
+            aliases,
+            *truncated,
+            query_type,
+        ),
         DnsAttemptResult::TransportError { .. } => "Transport error".to_owned(),
         DnsAttemptResult::ProtocolError => "Protocol error".to_owned(),
         DnsAttemptResult::Timeout => "Timed out".to_owned(),
@@ -278,21 +298,27 @@ fn diagnostic_attempt_summary(attempt: &Attempt) -> String {
 }
 
 pub(super) fn dns_attempt_response_label(
-    response_code: u16,
+    response_code: DnsResponseCode,
     addresses: &[std::net::IpAddr],
+    aliases: &[String],
     truncated: bool,
     query_type: DnsQueryType,
 ) -> String {
-    let code = DnsResponseCode::from(response_code);
     if !addresses.is_empty() {
-        return addresses
+        let mut label = addresses
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(", ");
+        if !aliases.is_empty() {
+            label.push_str(" (alias: ");
+            label.push_str(&aliases.join(", "));
+            label.push(')');
+        }
+        return label;
     }
-    match code {
-        DnsResponseCode::NxDomain => dns_response_code_label(code).to_owned(),
+    match response_code {
+        DnsResponseCode::NxDomain => dns_response_code_label(response_code).to_owned(),
         DnsResponseCode::NoError if truncated => "Response truncated".to_owned(),
         DnsResponseCode::NoError => match query_type {
             DnsQueryType::A => "No A address returned".to_owned(),
@@ -301,20 +327,6 @@ pub(super) fn dns_attempt_response_label(
         code if truncated => format!("{}; response truncated", dns_response_code_label(code)),
         DnsResponseCode::Other(value) => format!("DNS response code {value}"),
         code => dns_response_code_label(code).to_owned(),
-    }
-}
-
-fn exchange_outcome_label(outcome: &DnsExchangeOutcome, query_type: DnsQueryType) -> String {
-    match outcome {
-        DnsExchangeOutcome::Response {
-            response_code,
-            addresses,
-            truncated,
-            ..
-        } => dns_attempt_response_label((*response_code).into(), addresses, *truncated, query_type),
-        DnsExchangeOutcome::TransportError { .. } => "Transport error".to_owned(),
-        DnsExchangeOutcome::ProtocolError => "Protocol error".to_owned(),
-        DnsExchangeOutcome::Timeout => "Timed out".to_owned(),
     }
 }
 
@@ -367,7 +379,26 @@ fn decisive_diagnostic_attempt<'a>(
         .last()
 }
 
-const fn dns_query_type_label(query_type: DnsQueryType) -> &'static str {
+pub(super) fn name_resolution_outcome_label(
+    value: reach_core::NameResolutionEvidenceOutcome,
+) -> &'static str {
+    match value {
+        reach_core::NameResolutionEvidenceOutcome::Succeeded { .. } => {
+            "succeeded with usable addresses"
+        }
+        reach_core::NameResolutionEvidenceOutcome::SucceededWithoutUsableAddress => {
+            "completed, but returned no usable IP address"
+        }
+        reach_core::NameResolutionEvidenceOutcome::NegativeWithoutUsableAddress => {
+            "returned no usable IPv4 or IPv6 address"
+        }
+        reach_core::NameResolutionEvidenceOutcome::NonDefinitiveFailure => {
+            "failed without a definitive answer"
+        }
+    }
+}
+
+pub(super) const fn dns_query_type_label(query_type: DnsQueryType) -> &'static str {
     match query_type {
         DnsQueryType::A => "A",
         DnsQueryType::Aaaa => "AAAA",

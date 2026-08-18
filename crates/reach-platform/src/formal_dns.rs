@@ -18,8 +18,12 @@ pub(crate) struct FormalDnsConfig {
     pub ndots: u32,
     pub timeout: Duration,
     pub attempts: u32,
+    /// resolv.conf `options inet6`: IPv6 addresses are ordered before IPv4
+    /// addresses and the AAAA series carries the decisive error.
+    pub ipv6_first: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FormalDnsStepOutcome {
     Found(Vec<IpAddr>),
     NotFound,
@@ -57,9 +61,14 @@ pub(crate) async fn formal_dns_lookup(
         let (a, mut a_exchanges) = a?;
         let (aaaa, mut aaaa_exchanges) = aaaa?;
         query_names.push(candidate.clone());
-        exchanges.append(&mut a_exchanges);
-        exchanges.append(&mut aaaa_exchanges);
-        let outcome = combine(a, aaaa);
+        if config.ipv6_first {
+            exchanges.append(&mut aaaa_exchanges);
+            exchanges.append(&mut a_exchanges);
+        } else {
+            exchanges.append(&mut a_exchanges);
+            exchanges.append(&mut aaaa_exchanges);
+        }
+        let outcome = candidate_outcome(a, aaaa, config.ipv6_first);
         if let FormalDnsStepOutcome::Found(_) = &outcome {
             return Ok(FormalDnsOutcome {
                 outcome,
@@ -76,18 +85,23 @@ pub(crate) async fn formal_dns_lookup(
     })
 }
 
-fn combine(a: TypeSeriesOutcome, aaaa: TypeSeriesOutcome) -> FormalDnsStepOutcome {
-    match (a, aaaa) {
-        (TypeSeriesOutcome::Ok(mut a), TypeSeriesOutcome::Ok(aaaa)) => {
-            a.extend(aaaa);
-            FormalDnsStepOutcome::Found(a)
+fn candidate_outcome(
+    a: TypeSeriesOutcome,
+    aaaa: TypeSeriesOutcome,
+    ipv6_first: bool,
+) -> FormalDnsStepOutcome {
+    let (first, second) = if ipv6_first { (aaaa, a) } else { (a, aaaa) };
+    match (first, second) {
+        (TypeSeriesOutcome::Ok(mut first), TypeSeriesOutcome::Ok(second)) => {
+            first.extend(second);
+            FormalDnsStepOutcome::Found(first)
         }
-        (TypeSeriesOutcome::Ok(a), _) => FormalDnsStepOutcome::Found(a),
-        (TypeSeriesOutcome::NoRecords, TypeSeriesOutcome::Ok(aaaa)) => {
-            FormalDnsStepOutcome::Found(aaaa)
+        (TypeSeriesOutcome::Ok(first), _) => FormalDnsStepOutcome::Found(first),
+        (TypeSeriesOutcome::NoRecords, TypeSeriesOutcome::Ok(second)) => {
+            FormalDnsStepOutcome::Found(second)
         }
-        (TypeSeriesOutcome::Failed(_), TypeSeriesOutcome::Ok(aaaa)) => {
-            FormalDnsStepOutcome::Found(aaaa)
+        (TypeSeriesOutcome::Failed(_), TypeSeriesOutcome::Ok(second)) => {
+            FormalDnsStepOutcome::Found(second)
         }
         (TypeSeriesOutcome::NoRecords, TypeSeriesOutcome::NoRecords)
         | (TypeSeriesOutcome::NoRecords, TypeSeriesOutcome::Failed(_)) => {
@@ -162,8 +176,9 @@ async fn query_type_series(
                 return Err(PlatformError::OperationCancelled);
             }
             let endpoint = std::net::SocketAddr::new(*server, *port);
-            let (outcome, observation) = one_udp_exchange(
+            let (outcome, observation) = one_exchange(
                 endpoint,
+                DnsExchangeTransport::Udp,
                 name,
                 query_type,
                 config.timeout,
@@ -179,8 +194,9 @@ async fn query_type_series(
                     if cancellation.is_cancelled() {
                         return Err(PlatformError::OperationCancelled);
                     }
-                    let (outcome, observation) = one_tcp_exchange(
+                    let (outcome, observation) = one_exchange(
                         endpoint,
+                        DnsExchangeTransport::Tcp,
                         name,
                         query_type,
                         config.timeout,
@@ -262,46 +278,6 @@ fn classify_response(outcome: DnsAttemptResult) -> TypeSeriesOutcome {
     }
 }
 
-async fn one_udp_exchange(
-    endpoint: std::net::SocketAddr,
-    query_name: &str,
-    query_type: DnsQueryType,
-    budget: Duration,
-    cancellation: &CancellationToken,
-    clock: &impl ContinuousClock,
-) -> Result<(DnsAttemptResult, DnsExchangeObservation), PlatformError> {
-    one_exchange(
-        endpoint,
-        DnsExchangeTransport::Udp,
-        query_name,
-        query_type,
-        budget,
-        cancellation,
-        clock,
-    )
-    .await
-}
-
-async fn one_tcp_exchange(
-    endpoint: std::net::SocketAddr,
-    query_name: &str,
-    query_type: DnsQueryType,
-    budget: Duration,
-    cancellation: &CancellationToken,
-    clock: &impl ContinuousClock,
-) -> Result<(DnsAttemptResult, DnsExchangeObservation), PlatformError> {
-    one_exchange(
-        endpoint,
-        DnsExchangeTransport::Tcp,
-        query_name,
-        query_type,
-        budget,
-        cancellation,
-        clock,
-    )
-    .await
-}
-
 async fn one_exchange(
     endpoint: std::net::SocketAddr,
     transport: DnsExchangeTransport,
@@ -316,7 +292,10 @@ async fn one_exchange(
     } else {
         format!("{query_name}.")
     };
-    let query = dns_wire::build_query(0, &wire_name, query_type)?;
+    // Every formal exchange carries its own transaction id so a mismatched
+    // datagram can never be mistaken for this exchange's response.
+    let message_id = next_message_id();
+    let query = dns_wire::build_query(message_id, &wire_name, query_type)?;
     let wire = query
         .to_vec()
         .map_err(|error| PlatformError::InvalidDnsQueryName(error.to_string()))?;
@@ -394,6 +373,12 @@ fn exchange_outcome(outcome: DnsAttemptResult) -> DnsExchangeOutcome {
         DnsAttemptResult::ProtocolError => DnsExchangeOutcome::ProtocolError,
         DnsAttemptResult::Timeout => DnsExchangeOutcome::Timeout,
     }
+}
+
+fn next_message_id() -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT_MESSAGE_ID: AtomicU16 = AtomicU16::new(1);
+    NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -477,6 +462,7 @@ mod tests {
             ndots: 1,
             timeout: Duration::from_secs(2),
             attempts: 1,
+            ipv6_first: false,
         };
         let outcome = formal_dns_lookup(
             "admin",
@@ -555,6 +541,7 @@ mod tests {
             ndots: 1,
             timeout: Duration::from_secs(2),
             attempts: 1,
+            ipv6_first: false,
         };
         let outcome = formal_dns_lookup(
             "host",
@@ -621,6 +608,7 @@ mod tests {
             ndots: 1,
             timeout: Duration::from_millis(300),
             attempts: 1,
+            ipv6_first: false,
         };
         let outcome = formal_dns_lookup(
             "host.example.",
@@ -667,6 +655,7 @@ mod tests {
             ndots: 2,
             timeout: Duration::from_secs(5),
             attempts: 2,
+            ipv6_first: false,
         };
         assert_eq!(
             candidate_names("admin", &config),
@@ -688,6 +677,51 @@ mod tests {
                 "deep.name.internal.corp.example",
                 "deep.name.internal.example"
             ]
+        );
+    }
+
+    #[test]
+    fn ipv6_first_orders_aaaa_addresses_before_a_and_keeps_aaaa_errors_decisive() {
+        let v4 = "192.0.2.1".parse::<IpAddr>().expect("test address");
+        let v6 = "2001:db8::1".parse::<IpAddr>().expect("test address");
+        assert_eq!(
+            candidate_outcome(
+                TypeSeriesOutcome::Ok(vec![v4]),
+                TypeSeriesOutcome::Ok(vec![v6]),
+                true,
+            ),
+            FormalDnsStepOutcome::Found(vec![v6, v4])
+        );
+        assert_eq!(
+            candidate_outcome(
+                TypeSeriesOutcome::Ok(vec![v4]),
+                TypeSeriesOutcome::Ok(vec![v6]),
+                false,
+            ),
+            FormalDnsStepOutcome::Found(vec![v4, v6])
+        );
+        let timeout = DnsExchangeOutcome::Timeout;
+        assert_eq!(
+            candidate_outcome(
+                TypeSeriesOutcome::Failed(timeout.clone()),
+                TypeSeriesOutcome::NoRecords,
+                true,
+            ),
+            FormalDnsStepOutcome::Unavailable(format!(
+                "DNS source failed: {}",
+                formal_failure_reason(&timeout)
+            ))
+        );
+        assert_eq!(
+            candidate_outcome(
+                TypeSeriesOutcome::Failed(timeout),
+                TypeSeriesOutcome::NoRecords,
+                false,
+            ),
+            FormalDnsStepOutcome::Unavailable(format!(
+                "DNS source failed: {}",
+                formal_failure_reason(&DnsExchangeOutcome::Timeout)
+            ))
         );
     }
 

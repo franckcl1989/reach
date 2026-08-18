@@ -923,26 +923,36 @@ fn dns_diagnosis_limitation_evidence(
 }
 
 /// Key evidence for a no-formal-target hostname whose formal resolution
-/// observably consulted DNS. The decisive exchange per query type is retained;
-/// the exchanges never become targets and their purpose stays formal.
+/// observably consulted DNS. The decisive exchange per query type is retained
+/// together with any earlier exchange that ended in a hard failure, so a
+/// failed first resolver is never hidden behind a later successful one. The
+/// exchanges never become targets and their purpose stays formal.
 fn formal_dns_evidence(observation: &SystemResolverObservation) -> Vec<Evidence> {
-    let mut exchanges = observation
+    let exchanges = observation
         .name_resolution
         .steps
         .iter()
         .filter(|step| step.source == crate::NameResolutionSource::Dns)
         .flat_map(|step| step.dns_exchanges.iter())
         .collect::<Vec<_>>();
-    let mut decisive = Vec::with_capacity(2);
+    let mut decisive = Vec::new();
     for query_type in [DnsQueryType::A, DnsQueryType::Aaaa] {
-        if let Some(index) = exchanges
+        let of_type = exchanges
             .iter()
-            .rposition(|exchange| exchange.query_type == query_type)
-        {
-            decisive.push(exchanges.remove(index));
+            .filter(|exchange| exchange.query_type == query_type)
+            .copied()
+            .collect::<Vec<_>>();
+        if let Some(last) = of_type.last() {
+            decisive.push((*last).clone());
+        }
+        for exchange in of_type {
+            if exchange_ended_in_hard_failure(exchange) {
+                decisive.push(exchange.clone());
+            }
         }
     }
     decisive.sort_by_key(|exchange| exchange.query_type);
+    decisive.dedup_by(|left, right| left == right);
     decisive
         .into_iter()
         .enumerate()
@@ -950,9 +960,18 @@ fn formal_dns_evidence(observation: &SystemResolverObservation) -> Vec<Evidence>
             id: EvidenceId(10 + ordinal as u64),
             subject: EvidenceSubject::Hostname,
             role: EvidenceRole::BoundaryNarrowing,
-            fact: EvidenceFact::DnsExchange(DnsExchangeEvidence::Formal(exchange.clone())),
+            fact: EvidenceFact::DnsExchange(DnsExchangeEvidence::Formal(exchange)),
         })
         .collect()
+}
+
+fn exchange_ended_in_hard_failure(exchange: &crate::DnsExchangeObservation) -> bool {
+    matches!(
+        exchange.outcome,
+        crate::DnsExchangeOutcome::Timeout
+            | crate::DnsExchangeOutcome::TransportError { .. }
+            | crate::DnsExchangeOutcome::ProtocolError
+    )
 }
 
 #[derive(Clone)]
