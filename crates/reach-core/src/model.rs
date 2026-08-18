@@ -678,5 +678,10 @@ mod tests {
                 );
             }
         }
+
+        #[test]
+        fn typed_dns_response_code_round_trips_any_u16(code in any::<u16>()) {
+            prop_assert_eq!(u16::from(DnsResponseCode::from(code)), code);
+        }
     }
 }

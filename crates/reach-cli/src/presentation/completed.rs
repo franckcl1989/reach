@@ -190,12 +190,20 @@ fn render_key_evidence(output: &mut String, completed: &CompletedDiagnostic, the
     {
         return;
     }
-    let values = completed
+    let mut values = Vec::new();
+    for evidence in completed
         .key_evidence
         .iter()
         .filter(|evidence| name_resolution::evidence_is_distinct(completed, &evidence.fact))
-        .map(|evidence| evidence_summary(completed, evidence))
-        .collect::<Vec<_>>();
+    {
+        let summary = evidence_summary(completed, evidence);
+        // Core keeps every evidence item; identical adjacent summaries (for
+        // example one capability limitation per configured resolver
+        // candidate) collapse into one line instead of a visual wall.
+        if values.last() != Some(&summary) {
+            values.push(summary);
+        }
+    }
     if values.is_empty() {
         return;
     }

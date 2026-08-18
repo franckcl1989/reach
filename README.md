@@ -18,6 +18,11 @@ reach <address> [port]
   executes supported host NSS `files`/`dns` policy and returns exit 2 rather
   than skipping a reached unsupported source. Direct DNS is failure diagnosis
   only and can never create destination addresses for the primary check.
+- Name resolution is observable: when Reach can prove the actual DNS server
+  and exact query name of a formal lookup, it reports them; when the platform
+  system resolver does not expose them, Reach reports that capability boundary
+  instead of guessing. A hostname that produces no IP address gets a dedicated
+  `NAME RESOLUTION` explanation and never starts the requested TCP/ICMP check.
 
 Completed diagnostics go to stdout. Execution errors, cancellation, and
 TTY-only transient progress go to stderr.
@@ -47,6 +52,14 @@ correlation as unavailable on all platforms. Exact targeted-path lookup is
 unavailable on Linux and macOS; macOS also reports exact Neighbor lookup as
 unavailable. These limitations reduce failure localization depth but do not
 change an already-completed primary check.
+
+Exact formal DNS-server observation (0.1.4) is available on Linux when the
+executed NSS path reaches the `dns` source: every formal exchange records the
+endpoint actually used. On Windows and macOS the ordinary-user system resolver
+does not expose the exact server for a formal lookup, so Reach reports that
+boundary explicitly; a configured candidate is never relabeled as the server
+actually used, and later diagnostic DNS exchanges always carry their own exact
+endpoint with a diagnostic label.
 
 See `docs/0.1.0-native-capability-matrix.md` for the exact platform matrix and
 native release status.
@@ -93,7 +106,8 @@ artifact evidence is historical in `docs/0.1.1-release-evidence.md`. The
 Version 0.1.3's closure contract is in
 `docs/0.1.3-baseline-closure.md`; run-specific evidence is attached to the
 0.1.3 Release so no post-gate commit can separate the tag from the tested
-artifact source.
+artifact source. The 0.1.4 name-resolution observability contract is in
+`docs/0.1.4-name-resolution-closure.md`.
 
 ## Architecture and dependency policy
 

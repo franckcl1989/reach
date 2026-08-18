@@ -67,23 +67,6 @@ impl SystemResolverAdapter {
         let completed_at = clock.now()?;
         let name_resolution = match result {
             Ok(name_resolution) => name_resolution,
-            #[cfg(any(not(target_os = "linux"), test))]
-            Err(ResolverWorkerError::Resolution(failure)) => NameResolutionObservation {
-                input_name: hostname,
-                steps: vec![NameResolutionStep {
-                    source: NameResolutionSource::Unknown,
-                    query_names: Vec::new(),
-                    dns_exchanges: Vec::new(),
-                    outcome: NameResolutionStepOutcome::Unavailable {
-                        reason: failure.platform_message.clone(),
-                    },
-                    provenance: Provenance::new(ProvenanceSource::SystemResolver)
-                        .at(completed_at)
-                        .with_detail("resolution failed before any source step completed"),
-                }],
-                limitations: Vec::new(),
-                result: SystemResolverResult::Failed(failure),
-            },
             #[cfg(target_os = "linux")]
             Err(ResolverWorkerError::CapabilityUnavailable(message)) => {
                 return Err(PlatformError::NameResolutionCapabilityUnavailable(message));
@@ -132,36 +115,72 @@ fn system_lookup(
         socktype: SockType::Stream.into(),
         ..AddrInfoHints::default()
     };
-    let records = getaddrinfo(Some(hostname), None, Some(hints)).map_err(|error| {
-        let kind = error.kind();
-        let platform_code = error.error_num();
-        let error: io::Error = error.into();
-        if matches!(&kind, LookupErrorKind::Memory) || crate::is_resource_exhaustion(&error) {
-            ResolverWorkerError::ResourceExhausted(error.to_string())
-        } else {
-            ResolverWorkerError::Resolution(SystemResolverFailure {
+    let (result, outcome) = match getaddrinfo(Some(hostname), None, Some(hints)) {
+        Ok(records) => {
+            let addresses = match records
+                .map(|record| record.map(|record| target_from_socket_address(record.sockaddr)))
+                .collect::<io::Result<Vec<_>>>()
+            {
+                Ok(addresses) => addresses,
+                Err(error) => {
+                    if crate::is_resource_exhaustion(&error) {
+                        return Err(ResolverWorkerError::ResourceExhausted(error.to_string()));
+                    }
+                    let failure = SystemResolverFailure {
+                        kind: classify_io_error(&error),
+                        platform_code: error.raw_os_error(),
+                        platform_message: error.to_string(),
+                    };
+                    return Ok(opaque_observation(
+                        hostname,
+                        SystemResolverResult::Failed(failure.clone()),
+                        NameResolutionStepOutcome::Unavailable {
+                            reason: failure.platform_message,
+                        },
+                    ));
+                }
+            };
+            let outcome = if addresses.is_empty() {
+                NameResolutionStepOutcome::NotFound
+            } else {
+                NameResolutionStepOutcome::Found
+            };
+            (
+                SystemResolverResult::Succeeded(ResolverAddressSet::from_raw(addresses)),
+                outcome,
+            )
+        }
+        Err(error) => {
+            let kind = error.kind();
+            let platform_code = error.error_num();
+            let error: io::Error = error.into();
+            if matches!(&kind, LookupErrorKind::Memory) || crate::is_resource_exhaustion(&error) {
+                return Err(ResolverWorkerError::ResourceExhausted(error.to_string()));
+            }
+            let failure = SystemResolverFailure {
                 kind: classify_lookup_error(kind),
                 platform_code: Some(platform_code),
                 platform_message: error.to_string(),
-            })
-        }
-    })?;
-
-    let addresses = records
-        .map(|record| record.map(|record| target_from_socket_address(record.sockaddr)))
-        .collect::<io::Result<Vec<_>>>()
-        .map_err(|error| {
-            if crate::is_resource_exhaustion(&error) {
-                ResolverWorkerError::ResourceExhausted(error.to_string())
+            };
+            let outcome = if failure.kind == SystemResolverFailureKind::NoUsableAddress {
+                NameResolutionStepOutcome::NotFound
             } else {
-                ResolverWorkerError::Resolution(SystemResolverFailure {
-                    kind: classify_io_error(&error),
-                    platform_code: error.raw_os_error(),
-                    platform_message: error.to_string(),
-                })
-            }
-        })?;
+                NameResolutionStepOutcome::Unavailable {
+                    reason: failure.platform_message.clone(),
+                }
+            };
+            (SystemResolverResult::Failed(failure), outcome)
+        }
+    };
+    Ok(opaque_observation(hostname, result, outcome))
+}
 
+#[cfg(not(target_os = "linux"))]
+fn opaque_observation(
+    hostname: &str,
+    result: SystemResolverResult,
+    outcome: NameResolutionStepOutcome,
+) -> NameResolutionObservation {
     let limitation =
         "the exact formal DNS server identity selected by the platform system resolver is not exposed by the selected ordinary-user API"
             .to_owned();
@@ -169,20 +188,16 @@ fn system_lookup(
         source: NameResolutionSource::SystemResolverOpaque,
         query_names: Vec::new(),
         dns_exchanges: Vec::new(),
-        outcome: if addresses.is_empty() {
-            NameResolutionStepOutcome::NotFound
-        } else {
-            NameResolutionStepOutcome::Found
-        },
+        outcome,
         provenance: Provenance::new(ProvenanceSource::SystemResolver)
             .with_detail("opaque platform system resolver step"),
     }];
-    Ok(NameResolutionObservation {
+    NameResolutionObservation {
         input_name: hostname.to_owned(),
         steps,
         limitations: vec![limitation],
-        result: SystemResolverResult::Succeeded(ResolverAddressSet::from_raw(addresses)),
-    })
+        result,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -215,10 +230,10 @@ fn linux_lookup_with_paths(
         None,
         &CancellationToken::new(),
     )?;
-    match observation.result {
-        SystemResolverResult::Succeeded(addresses) => Ok(addresses.raw_addresses),
-        SystemResolverResult::Failed(failure) => Err(ResolverWorkerError::Resolution(failure)),
-    }
+    let SystemResolverResult::Succeeded(addresses) = observation.result else {
+        panic!("fixture lookup returned no addresses: {observation:?}");
+    };
+    Ok(addresses.raw_addresses)
 }
 
 #[cfg(target_os = "linux")]
@@ -574,8 +589,6 @@ fn validate_resolv_options(config: &resolv_conf::Config) -> Result<(), String> {
 
 #[derive(Debug)]
 enum ResolverWorkerError {
-    #[cfg(any(not(target_os = "linux"), test))]
-    Resolution(SystemResolverFailure),
     #[cfg(target_os = "linux")]
     CapabilityUnavailable(String),
     #[cfg(not(target_os = "linux"))]
@@ -733,9 +746,7 @@ mod tests {
         let error = fixture
             .resolve("admin")
             .expect_err("sss must not be skipped");
-        let ResolverWorkerError::CapabilityUnavailable(message) = error else {
-            panic!("expected required capability failure");
-        };
+        let ResolverWorkerError::CapabilityUnavailable(message) = error;
         assert!(message.contains("Other(\"sss\")"));
     }
 
@@ -747,13 +758,19 @@ mod tests {
             "127.0.0.1 localhost\n",
             "this is deliberately not a resolv.conf\n",
         );
-        let error = fixture
-            .resolve("admin")
-            .expect_err("negative result has no addresses");
-        let ResolverWorkerError::Resolution(failure) = error else {
-            panic!("unsupported source must remain unexecuted");
+        let observation = fixture
+            .observe("admin", 53)
+            .expect("negative result is a completed observation");
+        let SystemResolverResult::Failed(failure) = observation.result else {
+            panic!("negative result has no addresses");
         };
         assert_eq!(failure.kind, SystemResolverFailureKind::NoUsableAddress);
+        assert_eq!(observation.steps.len(), 1);
+        assert_eq!(observation.steps[0].source, NameResolutionSource::Hosts);
+        assert_eq!(
+            observation.steps[0].outcome,
+            NameResolutionStepOutcome::NotFound
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -950,9 +967,7 @@ mod tests {
         let error = fixture
             .resolve("example.com")
             .expect_err("scoped nameserver must fail closed");
-        let ResolverWorkerError::CapabilityUnavailable(message) = error else {
-            panic!("expected required capability failure");
-        };
+        let ResolverWorkerError::CapabilityUnavailable(message) = error;
         assert!(message.contains("fe80"));
     }
 

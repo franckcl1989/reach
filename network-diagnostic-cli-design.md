@@ -541,6 +541,56 @@ Capability Unavailable / ExecutionError(2) 结束；不得跳过该 source、猜
 
 调度器不得为全部待处理目标预先创建无限数量活动任务；活动工作集固定有界。若资源耗尽导致无法继续完整处理 resolver 已返回的正式目标，不得静默截断目标集合，必须进入 ExecutionError。
 
+### 9.5 名称解析可观测性（0.1.4）
+
+0.1.4 起，hostname 解析从“成功/失败”升级为**可观测事实**。Core 结果模型必须保存结构化观察：
+
+```text
+NameResolutionObservation {
+    input_name,
+    steps,          // 每个 NSS/平台解析步骤
+    limitations,    // 显式能力边界
+    result,         // 正式目标形成的唯一事实来源
+}
+
+NameResolutionStep {
+    source,         // Hosts / DNS / SystemResolverOpaque / …
+    query_names,    // 实际使用的精确 query name（按语义顺序）
+    dns_exchanges,  // 正式解析 DNS 交换观察
+    outcome,
+}
+
+DnsExchangeObservation {
+    purpose,        // FormalResolution | Diagnostic，禁止由排序推断
+    endpoint,       // 实际使用的 endpoint（地址+端口+必要时 scope）
+    transport,      // 仅在已观测时记录
+    query_name,     // 线路上发送的精确名称
+    query_type,     // A / AAAA
+    outcome,        // 类型化响应码/地址/别名/截断/超时/传输错误
+    timing,
+}
+```
+
+三类端点事实永久分离：
+
+```text
+Configured DNS endpoint（配置候选）
+!= Actual DNS endpoint（某次交换实际使用的 endpoint）
+!= Diagnostic DNS endpoint（系统解析失败后 Reach 自己发出的诊断交换）
+```
+
+任何 renderer 不得由配置顺序、interface metric、默认路由或后续诊断查询推断“实际使用”。配置候选永远不能升级为实际 endpoint；诊断查询结果永远不能改写系统 resolver 结果或成为正式目标。A 与 AAAA 是独立查询事实，不得合并为单一状态。
+
+**query name**：当 Reach 能观测精确 query name 时必须保留（含 search-domain/ndots 展开）。无法证明系统 resolver 实际查询名时，不得从 search 配置反推并当作事实；此情形保留显式能力边界。
+
+**Linux**：静态自包含 resolver 自行执行 `files`/`dns` 路径，因此必须直接插桩。`dns` 源使用产品自控的有界 DNS 客户端（成熟 Hickory 编解码器 + Tokio socket），每次线路交换都记录实际 endpoint、精确 query name、transport、响应语义与 timing；服务器顺序、resolv.conf `timeout`/`attempts`、search/ndots 语义被忠实保留。`files` 命中时 source = hosts 且不得出现任何 DNS server 声明。已执行路径上的不支持 source/选项仍为 Required Capability Unavailable（exit 2），不得为了显示 DNS server 而跳过。
+
+**Windows / macOS**：系统 resolver 为普通用户 API（`getaddrinfo`）不透明时，正式 DNS server 身份记录为显式能力边界（"Not exposed by this platform"）。配置候选保持为配置事实；Reach 自发的诊断查询可以记录该次交换的精确 endpoint，但必须标记为 Diagnostic。禁止 packet capture、提权或伪造精确度。
+
+**成功路径不发装饰性流量**：hostname 成功解析并进入目标检查后，不得仅为在输出中打印 DNS server 而追加 Direct DNS 查询。正式交换事实已观测时直接展示；未观测时接受能力边界。
+
+---
+
 ## 10. 正式目标的初始路径分析
 
 每个具体目标 IP 在任何产品可控主动探测之前，Core 必须先基于初始路由/路径选择现场形成诊断开始时的路径分析结果。
@@ -956,15 +1006,14 @@ loopback 或被操作系统判定为本地路径的目标仍按用户请求执�
 当系统 resolver 明确返回名称不存在/无匹配等确定性否定结果：
 
 - hostname 名称解析阶段立即结束；
-- 不主动探测 DNS Server；
-- 不自行发替代 DNS Query；
-- 因没有形成正式目标 IP，后续目标 TCP / ICMP / 路径诊断不执行。
-
-结论只能是：
+- 因没有形成正式目标 IP，后续目标 TCP / ICMP / 路径诊断不执行；
+- 结论只能是：
 
 > 当前系统正常名称解析路径无法得到该 hostname 的目标地址。
 
 不得扩大成“该名称在所有 DNS 环境中绝对不存在”。
+
+**0.1.4 起**，确定性否定结果不再无条件跳过 DNS 依赖诊断：当没有形成任何正式目标、诊断未被取消、且可观测事实表明 DNS 诊断在语义上适用时（正式解析已可观测地执行了 DNS 交换，或配置现场证明存在可诊断的经典 DNS 候选），Core 可以执行有界 DNS 依赖诊断。该诊断仍是 failure localization：不得形成正式目标、不得启动目标 TCP/ICMP、诊断地址不得成为目标、不得宣称该否定是全局不存在。不适用时（例如可证明 DNS 从未参与），不得为凑输出而发送诊断流量，并保留相应能力证据。
 
 ### 17.3 非确定性失败
 
@@ -976,6 +1025,8 @@ loopback 或被操作系统判定为本地路径的目标仍按用户请求执�
 4. 若能确认不存在任何适用的 resolver/名称解析配置路径，则停止主动 DNS 扩张，以“当前系统缺少可证明适用的解析路径”作为关键证据之一；
 5. 若现有平台事实不足以判断是否存在适用路径，则保持 Unknown/Indeterminate，不自行挑一台 DNS Server 猜测；
 6. 只有确认存在一个或多个明确适用、且可以进行 DNS 协议级诊断的 resolver dependency，才进入下一阶段。
+
+**0.1.4 起**，若正式系统解析已可观测地产生 DNS 交换观察（Linux 插桩路径），这些正式交换本身就是该 hostname 的 DNS 失败定位事实：不得再对同一 hostname 追加装饰性 Direct DNS 流量。只有正式解析不透明（Windows/macOS）且存在适用候选时，才运行第 18 章的 Direct DNS 依赖诊断。
 
 ---
 
@@ -1001,6 +1052,10 @@ loopback 或被操作系统判定为本地路径的目标仍按用户请求执�
 目标是解释当前 hostname 的系统名称解析失败，而不是评价 resolver 的一般递归能力。
 
 这里必须严格区分“用户原始 hostname”与“系统 resolver 实际产生过的 DNS query name”。对于单标签名称、search-domain/suffix、split-DNS 或其他 OS 名称扩展场景，如果平台无法可靠证明 system resolver 当次实际查询了哪个完全限定名称，则 direct DNS 对原始字符串的结果**只能作为补充观察**，不得描述成对 system resolver 原查询的等价复现，也不得据此否定或覆盖 system resolver 的失败事实。若直接查询原始字符串会造成明显错误归因，平台适配层可以将该 direct-DNS 分支标记为 QueryNameSemanticsUnavailable 并停止该分支；固定公共测试域仍然禁止。
+
+**0.1.4 起**，本章 Direct DNS 依赖诊断只适用于系统解析不透明的场景。正式解析已可观测地执行 DNS 交换时（§9.5），交换事实自身携带 purpose = FormalResolution 与精确 endpoint/query name，与本章 Diagnostic 交换在数据模型和展示上永久分离；诊断端点永远不得标注为“系统 resolver 实际使用的服务器”。
+
+**无正式目标的诊断触发（0.1.4）**：本章诊断的触发条件不再局限于 NonDefinitiveFailure。`SucceededWithoutUsableAddress`、`NegativeWithoutUsableAddress`、`NonDefinitiveFailure` 在“hostname 输入、无正式目标、未取消、DNS 诊断语义适用”时都可以进入。语义适用由可观测事实决定：正式解析存在可观测 DNS 交换，或配置现场证明存在可诊断的经典 DNS 候选。诊断结果始终为证据，不得形成正式目标或启动目标主检查。
 
 ### 18.3 A / AAAA
 
@@ -1081,6 +1136,8 @@ TCP DNS Attempt：
 DNS 报文字段级正确性、未知 RR、压缩、完整消息关联、扩展 RCODE 等底层协议细节交由成熟、标准兼容的 DNS 库负责。
 
 本产品不设计成 DNS 报文分析器，不默认保存完整 DNS 消息结构或原始报文。
+
+**0.1.4 起**，DNS 结果面向用户时使用直接可读语义名：`NXDOMAIN`、`SERVFAIL`、`REFUSED`、`FORMERR`、`NOTIMP`、`No A address returned`、`No AAAA address returned`、`Response truncated`、`Timed out`、`Transport error`、`Protocol error`。未知 RCODE 保持可表示（`DNS response code <n>`），原始数值继续在内部模型保留，渲染层不得要求用户自行解读协议数字。
 
 ### 18.9 直接 DNS 成功不能替代系统 resolver
 
@@ -1265,6 +1322,35 @@ CLI 不自行判断哪些底层事实重要，关键证据由 Core 产生。
 同一逻辑操作确有多次 Attempt 时显示，并从 1 局部计数；例如两次 TCP 后的一次
 ICMP 显示为 `TCP connect #1`、`TCP connect #2`、`ICMP Echo`。Path Attempt 使用
 hop 加该 hop 内的局部 attempt 编号。内部事实模型继续完整保留全局 Attempt identity。
+
+### 21.1b 名称解析展示（0.1.4）
+
+hostname 未形成正式目标时，输出必须以名称解析为中心：
+
+```text
+CHECK
+  Address            tt-gzb.eqfleetcmder.com
+  Requested test     ICMP Echo
+  Result             Not started
+
+NAME RESOLUTION
+  Source             DNS
+  DNS server         10.30.1.53
+  Query              tt-gzb.eqfleetcmder.com
+  A                  NXDOMAIN, 12 ms
+  AAAA               NXDOMAIN, 11 ms
+```
+
+规则：
+
+- 目标检查从未启动时使用 `Requested test` / `Result: Not started`，不得写成已经执行的 `Test`；
+- `NAME RESOLUTION` 展示正式解析事实：source、实际 DNS endpoint（仅可证实时）、精确 query name（仅可观测时；输入与 query 不同时同时显示 `Input`/`Query`）、A/AAAA 独立摘要行；
+- 系统 resolver 不透明时显示 `Formal DNS server: Not exposed by this platform`，配置候选与诊断端点都必须单独标注，不得冒充实标；
+- 确实运行了 Reach 自发的诊断 DNS 时才有 `DNS DIAGNOSTIC` 区，并在 `WHAT THIS MEANS` 中说明其仅为失败诊断、未用作目标地址；没有运行时该说明必须完全省略；
+- 默认 `EVIDENCE` 不得重复 `NAME RESOLUTION` / `DNS DIAGNOSTIC` 已完整表达的事实；能力边界类证据除外；
+- 成功路径保持简洁：可证实时在 CHECK 中追加一行 `DNS server`，hosts 命中时使用 `Name source: hosts`，不得凭空出现 DNS server 字段；IP literal 输出不得出现名称解析区；
+- 时长统一使用带空格的单位（`5 s`、`16 ms`、`1.2 s`），DNS/TCP/ICMP 共用同一格式化函数；
+- ICMP 证据措辞避免冗余，如 `ICMP Echo: Reply from 10.30.9.252 in 16 ms.`。
 
 ### 21.2 stdout / stderr
 
