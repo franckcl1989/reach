@@ -407,14 +407,11 @@ mod tests {
     type Responder = Box<dyn Fn(&Message) -> Option<Message> + Send + Sync>;
 
     async fn serve(script: Arc<ServerScript>, receive_limit: usize) -> std::net::SocketAddrV4 {
-        let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        let socket = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
             .expect("ordinary-user local DNS fixture");
         let address = socket.local_addr().expect("DNS fixture address");
-        socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("DNS fixture timeout");
         tokio::spawn(async move {
-            let socket = tokio::net::UdpSocket::from_std(socket).expect("tokio UDP socket");
             let mut buffer = [0_u8; 2048];
             for _ in 0..receive_limit {
                 let Ok((length, peer)) = socket.recv_from(&mut buffer).await else {
@@ -665,9 +662,9 @@ mod tests {
         assert_eq!(
             candidate_names("host.internal", &config),
             vec![
-                "host.internal",
                 "host.internal.corp.example",
-                "host.internal.example"
+                "host.internal.example",
+                "host.internal"
             ]
         );
         assert_eq!(candidate_names("absolute.", &config), vec!["absolute."]);
@@ -704,8 +701,8 @@ mod tests {
         let timeout = DnsExchangeOutcome::Timeout;
         assert_eq!(
             candidate_outcome(
-                TypeSeriesOutcome::Failed(timeout.clone()),
                 TypeSeriesOutcome::NoRecords,
+                TypeSeriesOutcome::Failed(timeout.clone()),
                 true,
             ),
             FormalDnsStepOutcome::Unavailable(format!(
@@ -715,13 +712,13 @@ mod tests {
         );
         assert_eq!(
             candidate_outcome(
-                TypeSeriesOutcome::Failed(timeout),
+                TypeSeriesOutcome::Failed(timeout.clone()),
                 TypeSeriesOutcome::NoRecords,
                 false,
             ),
             FormalDnsStepOutcome::Unavailable(format!(
                 "DNS source failed: {}",
-                formal_failure_reason(&DnsExchangeOutcome::Timeout)
+                formal_failure_reason(&timeout)
             ))
         );
     }

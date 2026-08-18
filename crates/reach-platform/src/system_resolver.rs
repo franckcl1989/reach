@@ -420,9 +420,9 @@ impl<'a> LinuxSourceResolver<'a> {
             match server {
                 ScopedIp::V4(address) => servers.push(((*address).into(), port)),
                 ScopedIp::V6(address, None) => servers.push(((*address).into(), port)),
-                ScopedIp::V6(_, Some(scope)) => {
+                ScopedIp::V6(address, Some(scope)) => {
                     return Err(format!(
-                        "scoped IPv6 nameserver scope {scope} requires interface binding that the self-contained formal resolver cannot verify"
+                        "scoped IPv6 nameserver {address}%{scope} requires interface binding that the self-contained formal resolver cannot verify"
                     ));
                 }
             }
