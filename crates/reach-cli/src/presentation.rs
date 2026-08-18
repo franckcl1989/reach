@@ -1,4 +1,4 @@
-use std::{fmt::Write as _, io};
+use std::{fmt::Write as _, io, time::Duration};
 
 use anstyle::{AnsiColor, Effects, Style};
 use reach_core::{DiagnosticResult, InputError};
@@ -6,6 +6,7 @@ use unicode_general_category::{GeneralCategory, get_general_category};
 
 mod completed;
 mod error;
+mod name_resolution;
 
 #[derive(Clone, Copy)]
 pub struct Theme {
@@ -191,6 +192,23 @@ pub fn terminal_escape(value: &str) -> String {
         .collect()
 }
 
+/// The single duration formatting used by every section, so DNS, TCP, and
+/// ICMP timings never drift apart.
+pub(crate) fn human_duration(value: Duration) -> String {
+    if value >= Duration::from_secs(1) {
+        let seconds = value.as_secs_f64();
+        if seconds.fract() == 0.0 {
+            format!("{} s", value.as_secs())
+        } else {
+            format!("{seconds:.1} s")
+        }
+    } else if value >= Duration::from_millis(1) {
+        format!("{} ms", value.as_millis())
+    } else {
+        "<1 ms".to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use reach_core::{Cancelled, DiagnosticResult, ExecutionError, ExecutionErrorKind, InputError};
@@ -206,6 +224,14 @@ mod tests {
             terminal_escape("bücher\n\x1b[31m\u{202e}tail"),
             "bücher\\n\\u{1b}[31m\\u{202e}tail"
         );
+    }
+
+    #[test]
+    fn durations_use_separated_units_shared_by_every_section() {
+        assert_eq!(human_duration(Duration::from_secs(5)), "5 s");
+        assert_eq!(human_duration(Duration::from_millis(16)), "16 ms");
+        assert_eq!(human_duration(Duration::from_millis(1_200)), "1.2 s");
+        assert_eq!(human_duration(Duration::from_micros(500)), "<1 ms");
     }
 
     #[test]

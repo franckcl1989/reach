@@ -1,21 +1,12 @@
-use std::{
-    io,
-    net::{IpAddr, SocketAddr},
-    time::Duration,
-};
+use std::{net::SocketAddr, time::Duration};
 
-use hickory_proto::{
-    op::{Message, MessageType, OpCode, Query},
-    rr::{Name, RData, RecordType},
-};
 use reach_core::{
     Attempt, AttemptId, AttemptKind, AttemptOutcome, AttemptSubject, AttemptTiming,
     DirectDnsTransportReason, DnsAttemptResult, DnsQueryType, Provenance, ProvenanceSource,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
-use crate::{ContinuousClock, PlatformError, clock::wait_until_continuous_deadline};
+use crate::{ContinuousClock, PlatformError, clock::wait_until_continuous_deadline, dns_wire};
 
 #[derive(Clone, Copy, Debug)]
 pub struct DirectDnsRequest<'a> {
@@ -33,13 +24,13 @@ pub async fn dns_udp_once(
     cancellation: &CancellationToken,
     clock: &impl ContinuousClock,
 ) -> Result<Attempt, PlatformError> {
-    let query = build_query(request.message_id, request.query_name, request.query_type)?;
+    let query = dns_wire::build_query(request.message_id, request.query_name, request.query_type)?;
     let wire = query
         .to_vec()
         .map_err(|error| PlatformError::InvalidDnsQueryName(error.to_string()))?;
     let started_at = clock.now()?;
     let deadline_at = started_at.saturating_add(request.budget);
-    let exchange = udp_exchange(request.resolver, &wire, &query, cancellation);
+    let exchange = dns_wire::udp_exchange(request.resolver, &wire, &query, cancellation);
     tokio::pin!(exchange);
     let timeout = wait_until_continuous_deadline(deadline_at, cancellation, clock);
     tokio::pin!(timeout);
@@ -79,13 +70,13 @@ pub async fn dns_tcp_once(
     cancellation: &CancellationToken,
     clock: &impl ContinuousClock,
 ) -> Result<Attempt, PlatformError> {
-    let query = build_query(request.message_id, request.query_name, request.query_type)?;
+    let query = dns_wire::build_query(request.message_id, request.query_name, request.query_type)?;
     let wire = query
         .to_vec()
         .map_err(|error| PlatformError::InvalidDnsQueryName(error.to_string()))?;
     let started_at = clock.now()?;
     let deadline_at = started_at.saturating_add(request.budget);
-    let exchange = tcp_exchange(request.resolver, &wire, &query);
+    let exchange = dns_wire::tcp_exchange(request.resolver, &wire, &query);
     tokio::pin!(exchange);
     let timeout = wait_until_continuous_deadline(deadline_at, cancellation, clock);
     tokio::pin!(timeout);
@@ -120,141 +111,6 @@ pub async fn dns_tcp_once(
     ))
 }
 
-fn build_query(
-    message_id: u16,
-    query_name: &str,
-    query_type: DnsQueryType,
-) -> Result<Message, PlatformError> {
-    let name = Name::from_ascii(query_name)
-        .map_err(|error| PlatformError::InvalidDnsQueryName(error.to_string()))?;
-    let record_type = match query_type {
-        DnsQueryType::A => RecordType::A,
-        DnsQueryType::Aaaa => RecordType::AAAA,
-    };
-    let mut message = Message::new(message_id, MessageType::Query, OpCode::Query);
-    message.metadata.recursion_desired = true;
-    message.add_query(Query::query(name, record_type));
-    Ok(message)
-}
-
-async fn udp_exchange(
-    resolver: SocketAddr,
-    wire: &[u8],
-    query: &Message,
-    cancellation: &CancellationToken,
-) -> Result<DnsAttemptResult, PlatformError> {
-    let bind_address = if resolver.is_ipv4() {
-        SocketAddr::from(([0, 0, 0, 0], 0))
-    } else {
-        SocketAddr::from(([0_u16; 8], 0))
-    };
-    let socket = match tokio::net::UdpSocket::bind(bind_address).await {
-        Ok(socket) => socket,
-        Err(error) => return transport_error(error),
-    };
-    if let Err(error) = socket.connect(resolver).await {
-        return transport_error(error);
-    }
-    if let Err(error) = socket.send(wire).await {
-        return transport_error(error);
-    }
-
-    let mut buffer = vec![0_u8; 65_535];
-    loop {
-        let received = tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return Err(PlatformError::OperationCancelled),
-            result = socket.recv(&mut buffer) => result,
-        };
-        let length = match received {
-            Ok(length) => length,
-            Err(error) => return transport_error(error),
-        };
-        let response = match Message::from_vec(&buffer[..length]) {
-            Ok(response) => response,
-            Err(_) => return Ok(DnsAttemptResult::ProtocolError),
-        };
-        if response.metadata.id != query.metadata.id {
-            continue;
-        }
-        return Ok(parse_correlated_response(response, query));
-    }
-}
-
-async fn tcp_exchange(
-    resolver: SocketAddr,
-    wire: &[u8],
-    query: &Message,
-) -> Result<DnsAttemptResult, PlatformError> {
-    let mut stream = match tokio::net::TcpStream::connect(resolver).await {
-        Ok(stream) => stream,
-        Err(error) => return transport_error(error),
-    };
-    let length = match u16::try_from(wire.len()) {
-        Ok(length) => length,
-        Err(_) => return Ok(DnsAttemptResult::ProtocolError),
-    };
-    if let Err(error) = stream.write_all(&length.to_be_bytes()).await {
-        return transport_error(error);
-    }
-    if let Err(error) = stream.write_all(wire).await {
-        return transport_error(error);
-    }
-    let mut length_prefix = [0_u8; 2];
-    if let Err(error) = stream.read_exact(&mut length_prefix).await {
-        return transport_error(error);
-    }
-    let response_length = usize::from(u16::from_be_bytes(length_prefix));
-    let mut response_wire = vec![0_u8; response_length];
-    if let Err(error) = stream.read_exact(&mut response_wire).await {
-        return transport_error(error);
-    }
-    let response = match Message::from_vec(&response_wire) {
-        Ok(response) => response,
-        Err(_) => return Ok(DnsAttemptResult::ProtocolError),
-    };
-    Ok(parse_correlated_response(response, query))
-}
-
-fn parse_correlated_response(response: Message, query: &Message) -> DnsAttemptResult {
-    if response.metadata.id != query.metadata.id
-        || response.metadata.message_type != MessageType::Response
-        || response.metadata.op_code != OpCode::Query
-        || response.queries != query.queries
-    {
-        return DnsAttemptResult::ProtocolError;
-    }
-
-    let mut addresses = Vec::new();
-    let mut aliases = Vec::new();
-    for record in &response.answers {
-        match &record.data {
-            RData::A(address) => addresses.push(IpAddr::V4(address.0)),
-            RData::AAAA(address) => addresses.push(IpAddr::V6(address.0)),
-            RData::CNAME(name) => aliases.push(name.to_string()),
-            _ => {}
-        }
-    }
-    DnsAttemptResult::Response {
-        response_code: response.metadata.response_code.into(),
-        addresses,
-        aliases,
-        truncated: response.metadata.truncation,
-    }
-}
-
-fn transport_error(error: io::Error) -> Result<DnsAttemptResult, PlatformError> {
-    if crate::is_resource_exhaustion(&error) {
-        Err(PlatformError::ResourceExhausted(error.to_string()))
-    } else if error.kind() == io::ErrorKind::TimedOut {
-        Ok(DnsAttemptResult::Timeout)
-    } else {
-        Ok(DnsAttemptResult::TransportError {
-            os_code: error.raw_os_error(),
-        })
-    }
-}
-
 fn dns_attempt(
     request: &DirectDnsRequest<'_>,
     kind: AttemptKind,
@@ -280,17 +136,20 @@ fn dns_attempt(
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
     use hickory_proto::{
-        op::ResponseCode,
-        rr::{Record, rdata::A},
+        op::{Message, OpCode, ResponseCode},
+        rr::{Name, RData, Record, rdata::A},
     };
     use proptest::prelude::*;
 
     use super::*;
+    use crate::SystemContinuousClock;
 
     #[test]
     fn codec_preserves_answer_order_and_duplicates() {
-        let query = build_query(17, "example.com.", DnsQueryType::A).unwrap();
+        let query = dns_wire::build_query(17, "example.com.", DnsQueryType::A).unwrap();
         let mut response = Message::response(17, OpCode::Query);
         response.queries = query.queries.clone();
         response.metadata.response_code = ResponseCode::NoError;
@@ -306,7 +165,7 @@ mod tests {
         ));
 
         let DnsAttemptResult::Response { addresses, .. } =
-            parse_correlated_response(response, &query)
+            dns_wire::parse_correlated_response(response, &query)
         else {
             panic!("expected parsed response");
         };
@@ -316,11 +175,11 @@ mod tests {
 
     #[test]
     fn wrong_transaction_id_is_a_protocol_error_on_a_correlated_stream() {
-        let query = build_query(17, "example.com.", DnsQueryType::A).unwrap();
+        let query = dns_wire::build_query(17, "example.com.", DnsQueryType::A).unwrap();
         let mut response = Message::response(18, OpCode::Query);
         response.queries = query.queries.clone();
         assert_eq!(
-            parse_correlated_response(response, &query),
+            dns_wire::parse_correlated_response(response, &query),
             DnsAttemptResult::ProtocolError
         );
     }
@@ -338,10 +197,7 @@ mod tests {
     }
 
     async fn exercise_local_direct_dns(loopback: IpAddr) {
-        use reach_core::DirectDnsTransportReason;
-        use tokio_util::sync::CancellationToken;
-
-        use crate::SystemContinuousClock;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let udp = tokio::net::UdpSocket::bind(SocketAddr::new(loopback, 0))
             .await
@@ -431,9 +287,9 @@ mod tests {
         ) {
             let parsed = Message::from_vec(&wire);
             if let Ok(message) = parsed {
-                let query = build_query(17, "example.com.", DnsQueryType::A)
+                let query = dns_wire::build_query(17, "example.com.", DnsQueryType::A)
                     .expect("fixed test query is valid");
-                let result = parse_correlated_response(message, &query);
+                let result = dns_wire::parse_correlated_response(message, &query);
                 let stayed_in_result_model = matches!(
                     result,
                     DnsAttemptResult::ProtocolError | DnsAttemptResult::Response { .. }

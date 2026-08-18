@@ -1,22 +1,26 @@
-use std::{fmt::Write as _, time::Duration};
+use std::fmt::Write as _;
 
 use comfy_table::{
     ContentArrangement, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_BORDERS_ONLY,
 };
-use humantime::format_duration;
 use reach_core::{
     AggregateOutcome, Attempt, AttemptId, AttemptKind, AttemptOutcome, CapabilityReason,
-    CompletedDiagnostic, Conclusion, DnsAttemptResult, DnsQueryType, Evidence, EvidenceFact,
-    HostnameResolutionOutcome, IcmpAttemptResult, IcmpMessageKind, NeighborObservation,
-    NeighborState, PrimaryOutcome, TargetDiagnostic, TargetIp, TcpAttemptResult,
+    CompletedDiagnostic, Conclusion, DnsAttemptResult, DnsExchangeEvidence, DnsQueryType, Evidence,
+    EvidenceFact, HostnameResolutionOutcome, IcmpAttemptResult, IcmpMessageKind,
+    NameResolutionEvidenceOutcome, NameResolutionSource, NeighborObservation, NeighborState,
+    PrimaryOutcome, TargetDiagnostic, TargetIp, TcpAttemptResult,
 };
 
-use super::{Theme, bullets, field, headline, paragraph, section, terminal_escape};
+use super::{
+    Theme, bullets, field, headline, human_duration, name_resolution, paragraph, section,
+    terminal_escape,
+};
 
 pub(super) fn render(completed: &CompletedDiagnostic, theme: Theme) -> String {
     let mut output = String::new();
     render_verdict(&mut output, completed, theme);
     render_check(&mut output, completed, theme);
+    name_resolution::render_name_resolution_sections(&mut output, completed, theme);
     if !completed.targets.is_empty() {
         render_targets(&mut output, completed, theme);
     }
@@ -52,6 +56,21 @@ fn render_check(output: &mut String, completed: &CompletedDiagnostic, theme: The
         "Address",
         terminal_escape(&completed.request.original_address),
     );
+    if completed.aggregate_outcome == AggregateOutcome::NoFormalTargets {
+        if let Some(port) = completed.request.port {
+            field(
+                output,
+                theme,
+                "Requested test",
+                format!("TCP connection to port {}", port.get()),
+            );
+        } else {
+            field(output, theme, "Requested test", "ICMP Echo");
+        }
+        field(output, theme, "Result", result_summary(completed));
+        let _ = writeln!(output);
+        return;
+    }
     if let Some(port) = completed.request.port {
         field(
             output,
@@ -62,11 +81,33 @@ fn render_check(output: &mut String, completed: &CompletedDiagnostic, theme: The
     } else {
         field(output, theme, "Test", "ICMP Echo");
     }
-    if let Some(summary) = resolver_check_summary(completed) {
-        field(output, theme, "Name resolution", summary);
+    if let Some((label, summary)) = resolver_check_summary(completed) {
+        field(output, theme, label, summary);
+    }
+    if let Some(servers) = formal_dns_servers(completed) {
+        if servers.len() == 1 {
+            field(output, theme, "DNS server", &servers[0]);
+        } else {
+            field(output, theme, "DNS servers", servers.join(", "));
+        }
     }
     field(output, theme, "Result", result_summary(completed));
     let _ = writeln!(output);
+}
+
+fn formal_dns_servers(completed: &CompletedDiagnostic) -> Option<Vec<String>> {
+    let exchanges = name_resolution::formal_exchanges(completed);
+    if exchanges.is_empty() {
+        return None;
+    }
+    let mut servers = Vec::new();
+    for exchange in &exchanges {
+        let endpoint = format!("{}:{}", exchange.endpoint.address, exchange.endpoint.port);
+        if !servers.contains(&endpoint) {
+            servers.push(endpoint);
+        }
+    }
+    Some(servers)
 }
 
 fn render_targets(output: &mut String, completed: &CompletedDiagnostic, theme: Theme) {
@@ -149,15 +190,17 @@ fn render_key_evidence(output: &mut String, completed: &CompletedDiagnostic, the
     {
         return;
     }
+    let values = completed
+        .key_evidence
+        .iter()
+        .filter(|evidence| name_resolution::evidence_is_distinct(completed, &evidence.fact))
+        .map(|evidence| evidence_summary(completed, evidence))
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return;
+    }
     section(output, theme, "EVIDENCE");
-    bullets(
-        output,
-        theme,
-        completed
-            .key_evidence
-            .iter()
-            .map(|evidence| evidence_summary(completed, evidence)),
-    );
+    bullets(output, theme, values);
     let _ = writeln!(output);
 }
 
@@ -401,12 +444,19 @@ fn meaning(completed: &CompletedDiagnostic) -> Vec<String> {
                 ]
             }
         }
-        AggregateOutcome::NoFormalTargets => vec![
-            "No destination connection or ICMP check was started because system name resolution did not provide a usable IP address."
-                .to_owned(),
-            "Any direct DNS evidence below is failure diagnosis only and was not used as a destination address."
-                .to_owned(),
-        ],
+        AggregateOutcome::NoFormalTargets => {
+            let mut values = vec![
+                "The hostname did not resolve to an IP address.".to_owned(),
+                "No ICMP or TCP check was started.".to_owned(),
+            ];
+            if name_resolution::diagnostic_dns_ran(completed) {
+                values.push(
+                    "Any direct DNS evidence above is failure diagnosis only and was not used as a destination address."
+                        .to_owned(),
+                );
+            }
+            values
+        }
     }
 }
 
@@ -443,38 +493,54 @@ fn actions(completed: &CompletedDiagnostic) -> Vec<String> {
             }
         }
         AggregateOutcome::NoFormalTargets => vec![
-            "Check the spelling of the hostname and try again.".to_owned(),
-            "If the name is correct, send this result to the support or network team."
-                .to_owned(),
+            "Check that the hostname is correct.".to_owned(),
+            "Check this computer's name-resolution/DNS configuration.".to_owned(),
         ],
     }
 }
 
-fn resolver_check_summary(completed: &CompletedDiagnostic) -> Option<String> {
+fn resolver_check_summary(completed: &CompletedDiagnostic) -> Option<(&'static str, String)> {
     match &completed.hostname_resolution {
         HostnameResolutionOutcome::NotRequested => None,
-        HostnameResolutionOutcome::Succeeded(addresses) => Some(format!(
-            "{}, {} checked",
-            counted(
-                addresses.raw_addresses.len(),
-                "address returned",
-                "addresses returned"
-            ),
-            counted(
-                addresses.formal_targets.len(),
-                "unique address",
-                "unique addresses"
-            )
+        HostnameResolutionOutcome::Succeeded(addresses) => {
+            if let Some(observation) = &completed.system_resolver
+                && observation
+                    .name_resolution
+                    .steps
+                    .last()
+                    .is_some_and(|step| step.source == NameResolutionSource::Hosts)
+            {
+                return Some(("Name source", "hosts".to_owned()));
+            }
+            Some((
+                "Name resolution",
+                format!(
+                    "{}, {} checked",
+                    counted(
+                        addresses.raw_addresses.len(),
+                        "address returned",
+                        "addresses returned"
+                    ),
+                    counted(
+                        addresses.formal_targets.len(),
+                        "unique address",
+                        "unique addresses"
+                    )
+                ),
+            ))
+        }
+        HostnameResolutionOutcome::SucceededWithoutUsableAddress => Some((
+            "Name resolution",
+            "completed, but returned no usable IP address".to_owned(),
         )),
-        HostnameResolutionOutcome::SucceededWithoutUsableAddress => {
-            Some("completed, but returned no usable IP address".to_owned())
-        }
-        HostnameResolutionOutcome::NegativeWithoutUsableAddress { .. } => {
-            Some("returned no usable IPv4 or IPv6 address".to_owned())
-        }
-        HostnameResolutionOutcome::NonDefinitiveFailure { .. } => {
-            Some("failed without a definitive answer".to_owned())
-        }
+        HostnameResolutionOutcome::NegativeWithoutUsableAddress { .. } => Some((
+            "Name resolution",
+            "returned no usable IPv4 or IPv6 address".to_owned(),
+        )),
+        HostnameResolutionOutcome::NonDefinitiveFailure { .. } => Some((
+            "Name resolution",
+            "failed without a definitive answer".to_owned(),
+        )),
     }
 }
 
@@ -502,7 +568,7 @@ fn result_summary(completed: &CompletedDiagnostic) -> String {
                 _ => format!("{failed} failed, {inconclusive} inconclusive"),
             }
         }
-        AggregateOutcome::NoFormalTargets => "No IP address checked".to_owned(),
+        AggregateOutcome::NoFormalTargets => "Not started".to_owned(),
     }
 }
 
@@ -676,12 +742,32 @@ fn evidence_summary(completed: &CompletedDiagnostic, evidence: &Evidence) -> Str
             neighbor_observation_label(*before),
             neighbor_state_label(*after)
         ),
-        EvidenceFact::SystemResolverResult(_) => resolver_check_summary(completed).map_or_else(
-            || "System name resolution completed.".to_owned(),
-            |summary| format!("Name resolution: {summary}."),
-        ),
-        EvidenceFact::DirectDnsResult(value) => {
-            format!("Direct DNS diagnostic: {}.", terminal_escape(value))
+        EvidenceFact::NameResolution(value) => {
+            format!(
+                "Name resolution: {}.",
+                name_resolution_outcome_label(value.outcome)
+            )
+        }
+        EvidenceFact::DnsExchange(DnsExchangeEvidence::Formal(exchange)) => {
+            let query_type = match exchange.query_type {
+                DnsQueryType::A => "A",
+                DnsQueryType::Aaaa => "AAAA",
+            };
+            format!(
+                "Formal DNS {query_type} exchange with {} for {}: {}.",
+                exchange.endpoint.address,
+                terminal_escape(&exchange.query_name),
+                name_resolution::formal_exchange_summary(exchange),
+            )
+        }
+        EvidenceFact::DnsExchange(DnsExchangeEvidence::Diagnostic(id)) => {
+            find_attempt(completed, *id).map_or_else(
+                || {
+                    "A direct DNS diagnostic attempt was retained, but its detail is unavailable."
+                        .to_owned()
+                },
+                |(attempt, ordinal)| attempt_evidence_summary(attempt, ordinal),
+            )
         }
         EvidenceFact::CapabilityUnavailable { capability, reason } => format!(
             "{} unavailable: {}.",
@@ -695,6 +781,19 @@ fn evidence_summary(completed: &CompletedDiagnostic, evidence: &Evidence) -> Str
         EvidenceFact::SocketPathComparison(value) => {
             format!("Targeted OS path comparison: {}.", terminal_escape(value))
         }
+    }
+}
+
+fn name_resolution_outcome_label(value: NameResolutionEvidenceOutcome) -> &'static str {
+    match value {
+        NameResolutionEvidenceOutcome::Succeeded { .. } => "succeeded with usable addresses",
+        NameResolutionEvidenceOutcome::SucceededWithoutUsableAddress => {
+            "completed, but returned no usable IP address"
+        }
+        NameResolutionEvidenceOutcome::NegativeWithoutUsableAddress => {
+            "returned no usable IPv4 or IPv6 address"
+        }
+        NameResolutionEvidenceOutcome::NonDefinitiveFailure => "failed without a definitive answer",
     }
 }
 
@@ -860,17 +959,24 @@ fn dns_outcome_label(result: &DnsAttemptResult) -> String {
             addresses,
             aliases,
             truncated,
-        } => format!(
-            "DNS response code {response_code}; {}; {}; truncated={truncated}",
-            counted(addresses.len(), "address", "addresses"),
-            counted(aliases.len(), "alias", "aliases")
-        ),
+        } => {
+            let mut label = name_resolution::dns_attempt_response_label(
+                *response_code,
+                addresses,
+                *truncated,
+                DnsQueryType::A,
+            );
+            if !aliases.is_empty() {
+                let _ = write!(label, "; {}", counted(aliases.len(), "alias", "aliases"));
+            }
+            label
+        }
         DnsAttemptResult::TransportError { os_code } => format!(
-            "DNS transport error{}",
+            "Transport error{}",
             os_code.map_or_else(String::new, |code| format!(" (OS code {code})"))
         ),
-        DnsAttemptResult::ProtocolError => "DNS protocol error".to_owned(),
-        DnsAttemptResult::Timeout => "no DNS result before the deadline".to_owned(),
+        DnsAttemptResult::ProtocolError => "Protocol error".to_owned(),
+        DnsAttemptResult::Timeout => "Timed out".to_owned(),
     }
 }
 
@@ -945,10 +1051,6 @@ fn counted(count: usize, singular: &str, plural: &str) -> String {
     }
 }
 
-fn human_duration(value: Duration) -> String {
-    format_duration(value).to_string()
-}
-
 const fn dns_query_type_label(value: DnsQueryType) -> &'static str {
     match value {
         DnsQueryType::A => "A",
@@ -958,7 +1060,7 @@ const fn dns_query_type_label(value: DnsQueryType) -> &'static str {
 
 const fn icmp_kind_label(value: IcmpMessageKind) -> &'static str {
     match value {
-        IcmpMessageKind::EchoReply => "ICMP Echo Reply",
+        IcmpMessageKind::EchoReply => "Reply",
         IcmpMessageKind::DestinationUnreachable => "ICMP Destination Unreachable",
         IcmpMessageKind::TimeExceeded => "ICMP Time Exceeded",
         IcmpMessageKind::PacketTooBig => "ICMP Packet Too Big",
@@ -975,8 +1077,9 @@ mod tests {
     use reach_core::{
         CapabilityValue, CompletedDiagnostic, EvidenceId, EvidenceRole, EvidenceSubject,
         HostnameResolutionOutcome, IcmpNativeStatus, InitialNetworkSnapshot, InterfaceFact,
-        PrimaryOutcome, Provenance, ProvenanceSource, ResolverConfiguration, RouteFact,
-        TargetNetworkFacts, analyze_initial_path, parse_request,
+        NameResolutionEvidenceOutcome, NameResolutionSource, PrimaryOutcome, Provenance,
+        ProvenanceSource, ResolverConfiguration, RouteFact, TargetNetworkFacts,
+        analyze_initial_path, parse_request,
     };
     use unicode_width::UnicodeWidthStr as _;
 
@@ -987,9 +1090,9 @@ mod tests {
 
         assert!(output.contains("Two TCP connection attempts to 192.0.2.20:8443 timed out"));
         assert!(output.contains("That IP address replied to ICMP Echo"));
-        assert!(output.contains("TCP connect #1: No result before the 5s deadline"));
-        assert!(output.contains("TCP connect #2: No result before the 5s deadline"));
-        assert!(output.contains("ICMP Echo: ICMP Echo Reply from 192.0.2.20"));
+        assert!(output.contains("TCP connect #1: No result before the 5 s deadline"));
+        assert!(output.contains("TCP connect #2: No result before the 5 s deadline"));
+        assert!(output.contains("ICMP Echo: Reply from 192.0.2.20"));
         assert!(output.contains("This does not prove that the port is closed"));
         for forbidden in [
             "TECHNICAL DETAILS",
@@ -1061,6 +1164,448 @@ mod tests {
     }
 
     #[test]
+    fn name_resolution_section_explains_a_no_formal_target_failure() {
+        let snapshot = synthetic_snapshot();
+        let exchanges = vec![
+            formal_exchange(
+                DnsQueryType::A,
+                reach_core::DnsResponseCode::NxDomain,
+                "missing.example.",
+                Duration::from_millis(12),
+            ),
+            formal_exchange(
+                DnsQueryType::Aaaa,
+                reach_core::DnsResponseCode::NxDomain,
+                "missing.example.",
+                Duration::from_millis(11),
+            ),
+        ];
+        let completed = CompletedDiagnostic::new(
+            parse_request("missing.example", None).expect("valid request"),
+            snapshot.clone(),
+            Some(resolver_observation(
+                "missing.example",
+                vec![reach_core::NameResolutionStep {
+                    source: NameResolutionSource::Dns,
+                    query_names: vec!["missing.example".into()],
+                    dns_exchanges: exchanges,
+                    outcome: reach_core::NameResolutionStepOutcome::NotFound,
+                    provenance: provenance(),
+                }],
+                Vec::new(),
+                reach_core::SystemResolverResult::Failed(reach_core::SystemResolverFailure {
+                    kind: reach_core::SystemResolverFailureKind::NoUsableAddress,
+                    platform_code: None,
+                    platform_message: "no usable address".into(),
+                }),
+            )),
+            HostnameResolutionOutcome::NegativeWithoutUsableAddress {
+                platform_code: None,
+            },
+            Vec::new(),
+            Vec::new(),
+            vec![
+                Evidence {
+                    id: EvidenceId(1),
+                    subject: EvidenceSubject::Hostname,
+                    role: EvidenceRole::PrimaryDecision,
+                    fact: EvidenceFact::NameResolution(reach_core::NameResolutionEvidence {
+                        outcome: NameResolutionEvidenceOutcome::NegativeWithoutUsableAddress,
+                    }),
+                },
+                Evidence {
+                    id: EvidenceId(2),
+                    subject: EvidenceSubject::Hostname,
+                    role: EvidenceRole::CapabilityLimitation,
+                    fact: EvidenceFact::CapabilityUnavailable {
+                        capability: "resolver transport diagnosis".into(),
+                        reason: CapabilityReason::QuerySemanticsUnavailable,
+                    },
+                },
+            ],
+        );
+        let output = render(&completed, Theme::plain());
+
+        assert!(output.starts_with("× NO USABLE IP ADDRESS\n"));
+        assert!(output.contains("Requested test     ICMP Echo"));
+        assert!(output.contains("Result             Not started"));
+        assert!(output.contains("NAME RESOLUTION"));
+        assert!(output.contains("Source             DNS"));
+        assert!(output.contains("DNS server         192.0.2.53:53"));
+        assert!(output.contains("Query              missing.example"));
+        assert!(output.contains("A                  NXDOMAIN, 12 ms"));
+        assert!(output.contains("AAAA               NXDOMAIN, 11 ms"));
+        assert!(output.contains("The hostname did not resolve to an IP address"));
+        assert!(output.contains("No ICMP or TCP check was started"));
+        assert!(output.contains("Check that the hostname is correct"));
+        assert!(output.contains("Check this computer's name-resolution/DNS configuration"));
+        assert!(!output.contains("Any direct DNS evidence"));
+        assert!(!output.contains("DNS DIAGNOSTIC"));
+        assert!(output.contains("EVIDENCE"));
+        assert!(!output.contains("Name resolution: returned no usable IPv4 or IPv6 address"));
+        assert!(output.contains("resolver transport diagnosis unavailable"));
+        assert!(!output.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn diagnostic_dns_section_is_labeled_and_conditional() {
+        let snapshot = synthetic_snapshot();
+        let completed = CompletedDiagnostic::new(
+            parse_request("missing.example", None).expect("valid request"),
+            snapshot.clone(),
+            Some(resolver_observation(
+                "missing.example",
+                vec![reach_core::NameResolutionStep {
+                    source: NameResolutionSource::SystemResolverOpaque,
+                    query_names: Vec::new(),
+                    dns_exchanges: Vec::new(),
+                    outcome: reach_core::NameResolutionStepOutcome::NotFound,
+                    provenance: provenance(),
+                }],
+                vec!["the exact formal DNS server identity selected by the platform system resolver is not exposed by the selected ordinary-user API".into()],
+                reach_core::SystemResolverResult::Failed(reach_core::SystemResolverFailure {
+                    kind: reach_core::SystemResolverFailureKind::NoUsableAddress,
+                    platform_code: None,
+                    platform_message: "no usable address".into(),
+                }),
+            )),
+            HostnameResolutionOutcome::NegativeWithoutUsableAddress { platform_code: None },
+            Vec::new(),
+            resolver_diagnostics(snapshot),
+            vec![Evidence {
+                id: EvidenceId(1),
+                subject: EvidenceSubject::Hostname,
+                role: EvidenceRole::PrimaryDecision,
+                fact: EvidenceFact::NameResolution(reach_core::NameResolutionEvidence {
+                    outcome: NameResolutionEvidenceOutcome::NegativeWithoutUsableAddress,
+                }),
+            }],
+        );
+        let output = render(&completed, Theme::plain());
+
+        assert!(output.contains("Formal DNS server  Not exposed by this platform"));
+        assert!(output.contains("DNS DIAGNOSTIC"));
+        assert!(output.contains("Server             192.0.2.53:53"));
+        assert!(output.contains("Query              missing.example"));
+        assert!(output.contains("A                  NXDOMAIN"));
+        assert!(output.contains("AAAA               SERVFAIL"));
+        let flattened = output.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flattened.contains(
+            "Any direct DNS evidence above is failure diagnosis only and was not used as a destination address"
+        ));
+        assert!(!output.contains("EVIDENCE"));
+    }
+
+    #[test]
+    fn search_expansion_is_displayed_only_when_the_query_name_differs() {
+        let snapshot = synthetic_snapshot();
+        let exchanges = vec![
+            formal_exchange(
+                DnsQueryType::A,
+                reach_core::DnsResponseCode::NxDomain,
+                "admin.corp.example.",
+                Duration::ZERO,
+            ),
+            formal_exchange(
+                DnsQueryType::A,
+                reach_core::DnsResponseCode::NxDomain,
+                "admin.",
+                Duration::ZERO,
+            ),
+            formal_exchange(
+                DnsQueryType::Aaaa,
+                reach_core::DnsResponseCode::NxDomain,
+                "admin.corp.example.",
+                Duration::ZERO,
+            ),
+            formal_exchange(
+                DnsQueryType::Aaaa,
+                reach_core::DnsResponseCode::NxDomain,
+                "admin.",
+                Duration::ZERO,
+            ),
+        ];
+        let completed = CompletedDiagnostic::new(
+            parse_request("admin", None).expect("valid request"),
+            snapshot.clone(),
+            Some(resolver_observation(
+                "admin",
+                vec![reach_core::NameResolutionStep {
+                    source: NameResolutionSource::Dns,
+                    query_names: vec!["admin.corp.example".into(), "admin".into()],
+                    dns_exchanges: exchanges,
+                    outcome: reach_core::NameResolutionStepOutcome::NotFound,
+                    provenance: provenance(),
+                }],
+                Vec::new(),
+                reach_core::SystemResolverResult::Failed(reach_core::SystemResolverFailure {
+                    kind: reach_core::SystemResolverFailureKind::NoUsableAddress,
+                    platform_code: None,
+                    platform_message: "no usable address".into(),
+                }),
+            )),
+            HostnameResolutionOutcome::NegativeWithoutUsableAddress {
+                platform_code: None,
+            },
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let output = render(&completed, Theme::plain());
+
+        assert!(output.contains("Input              admin"));
+        assert!(output.contains("Query              admin.corp.example, admin"));
+    }
+
+    #[test]
+    fn hostname_dns_success_shows_the_actual_dns_server_compactly() {
+        let snapshot = synthetic_snapshot();
+        let target_ip = TargetIp::v4(Ipv4Addr::new(192, 0, 2, 20));
+        let completed = CompletedDiagnostic::new(
+            parse_request("example.com", None).expect("valid request"),
+            snapshot.clone(),
+            Some(resolver_observation(
+                "example.com",
+                vec![reach_core::NameResolutionStep {
+                    source: NameResolutionSource::Dns,
+                    query_names: vec!["example.com".into()],
+                    dns_exchanges: vec![formal_exchange(
+                        DnsQueryType::A,
+                        reach_core::DnsResponseCode::NoError,
+                        "example.com.",
+                        Duration::from_millis(8),
+                    )],
+                    outcome: reach_core::NameResolutionStepOutcome::Found,
+                    provenance: provenance(),
+                }],
+                Vec::new(),
+                reach_core::SystemResolverResult::Succeeded(
+                    reach_core::ResolverAddressSet::from_raw(vec![target_ip.clone()]),
+                ),
+            )),
+            HostnameResolutionOutcome::Succeeded(reach_core::ResolverAddressSet::from_raw(vec![
+                target_ip.clone(),
+            ])),
+            vec![result_only_target(
+                &snapshot,
+                target_ip,
+                0,
+                PrimaryOutcome::Satisfied,
+                Conclusion::IcmpEchoReplied,
+            )],
+            Vec::new(),
+            Vec::new(),
+        );
+        let output = render(&completed, Theme::plain());
+
+        assert!(output.contains("Name resolution    1 address returned, 1 unique address checked"));
+        assert!(output.contains("DNS server         192.0.2.53:53"));
+        assert!(!output.contains("NAME RESOLUTION"));
+        assert!(!output.contains("EVIDENCE"));
+    }
+
+    #[test]
+    fn hosts_success_uses_name_source_without_a_dns_server_claim() {
+        let snapshot = synthetic_snapshot();
+        let target_ip = TargetIp::v4(Ipv4Addr::new(192, 0, 2, 20));
+        let completed = CompletedDiagnostic::new(
+            parse_request("app.internal", None).expect("valid request"),
+            snapshot.clone(),
+            Some(resolver_observation(
+                "app.internal",
+                vec![reach_core::NameResolutionStep {
+                    source: NameResolutionSource::Hosts,
+                    query_names: Vec::new(),
+                    dns_exchanges: Vec::new(),
+                    outcome: reach_core::NameResolutionStepOutcome::Found,
+                    provenance: provenance(),
+                }],
+                Vec::new(),
+                reach_core::SystemResolverResult::Succeeded(
+                    reach_core::ResolverAddressSet::from_raw(vec![target_ip.clone()]),
+                ),
+            )),
+            HostnameResolutionOutcome::Succeeded(reach_core::ResolverAddressSet::from_raw(vec![
+                target_ip.clone(),
+            ])),
+            vec![result_only_target(
+                &snapshot,
+                target_ip,
+                0,
+                PrimaryOutcome::Satisfied,
+                Conclusion::IcmpEchoReplied,
+            )],
+            Vec::new(),
+            Vec::new(),
+        );
+        let output = render(&completed, Theme::plain());
+
+        assert!(output.contains("Name source        hosts"));
+        assert!(!output.contains("DNS server"));
+    }
+
+    #[test]
+    fn dns_response_codes_render_symbolically_and_unknown_codes_stay_numbered() {
+        assert_eq!(
+            name_resolution::dns_attempt_response_label(3, &[], false, DnsQueryType::A),
+            "NXDOMAIN"
+        );
+        assert_eq!(
+            name_resolution::dns_attempt_response_label(2, &[], false, DnsQueryType::Aaaa),
+            "SERVFAIL"
+        );
+        assert_eq!(
+            name_resolution::dns_attempt_response_label(5, &[], false, DnsQueryType::A),
+            "REFUSED"
+        );
+        assert_eq!(
+            name_resolution::dns_attempt_response_label(0, &[], false, DnsQueryType::A),
+            "No A address returned"
+        );
+        assert_eq!(
+            name_resolution::dns_attempt_response_label(0, &[], false, DnsQueryType::Aaaa),
+            "No AAAA address returned"
+        );
+        assert_eq!(
+            name_resolution::dns_attempt_response_label(0, &[], true, DnsQueryType::A),
+            "Response truncated"
+        );
+        assert_eq!(
+            name_resolution::dns_attempt_response_label(12, &[], false, DnsQueryType::A),
+            "DNS response code 12"
+        );
+        assert_eq!(
+            name_resolution::dns_attempt_response_label(
+                0,
+                &[Ipv4Addr::new(192, 0, 2, 1).into()],
+                false,
+                DnsQueryType::A
+            ),
+            "192.0.2.1"
+        );
+    }
+
+    fn resolver_observation(
+        input_name: &str,
+        steps: Vec<reach_core::NameResolutionStep>,
+        limitations: Vec<String>,
+        result: reach_core::SystemResolverResult,
+    ) -> reach_core::SystemResolverObservation {
+        reach_core::SystemResolverObservation {
+            started_at: Duration::ZERO,
+            completed_at: Duration::from_millis(1),
+            name_resolution: reach_core::NameResolutionObservation {
+                input_name: input_name.into(),
+                steps,
+                limitations,
+                result,
+            },
+            provenance: provenance(),
+        }
+    }
+
+    fn formal_exchange(
+        query_type: DnsQueryType,
+        response_code: reach_core::DnsResponseCode,
+        query_name: &str,
+        duration: Duration,
+    ) -> reach_core::DnsExchangeObservation {
+        let started_at = Duration::ZERO;
+        reach_core::DnsExchangeObservation {
+            purpose: reach_core::DnsExchangePurpose::FormalResolution,
+            endpoint: reach_core::IpEndpoint {
+                address: Ipv4Addr::new(192, 0, 2, 53).into(),
+                port: 53,
+                scope_id: None,
+            },
+            transport: reach_core::DnsExchangeTransport::Udp,
+            query_name: query_name.into(),
+            query_type,
+            outcome: reach_core::DnsExchangeOutcome::Response {
+                response_code,
+                addresses: Vec::new(),
+                aliases: Vec::new(),
+                truncated: false,
+            },
+            timing: reach_core::AttemptTiming {
+                started_at,
+                deadline_at: Duration::from_secs(1),
+                completed_at: started_at + duration,
+            },
+            provenance: provenance(),
+        }
+    }
+
+    fn resolver_diagnostics(
+        snapshot: InitialNetworkSnapshot,
+    ) -> Vec<reach_core::ResolverDependencyDiagnostic> {
+        let endpoint = reach_core::ResolverEndpoint {
+            address: Ipv4Addr::new(192, 0, 2, 53).into(),
+            port: 53,
+            transport: reach_core::ResolverTransport::Udp,
+            interface: None,
+            domains: Vec::new(),
+            priority: Some(0),
+            provenance: provenance(),
+        };
+        let target = TargetIp::v4(Ipv4Addr::new(192, 0, 2, 53));
+        let attempts = vec![
+            dns_attempt(
+                1,
+                DnsQueryType::A,
+                DnsAttemptResult::Response {
+                    response_code: 3,
+                    addresses: Vec::new(),
+                    aliases: Vec::new(),
+                    truncated: false,
+                },
+            ),
+            dns_attempt(
+                2,
+                DnsQueryType::Aaaa,
+                DnsAttemptResult::Response {
+                    response_code: 2,
+                    addresses: Vec::new(),
+                    aliases: Vec::new(),
+                    truncated: false,
+                },
+            ),
+        ];
+        vec![reach_core::ResolverDependencyDiagnostic::new(
+            endpoint,
+            TargetNetworkFacts {
+                initial_path: analyze_initial_path(&snapshot, &target),
+                current_path: CapabilityValue::unavailable(
+                    CapabilityReason::QuerySemanticsUnavailable,
+                    provenance(),
+                ),
+                neighbor_pre_state: None,
+                neighbor_post_state: None,
+            },
+            attempts,
+            Vec::new(),
+        )]
+    }
+
+    fn dns_attempt(id: u64, query_type: DnsQueryType, outcome: DnsAttemptResult) -> Attempt {
+        Attempt {
+            id: AttemptId(id),
+            subject: reach_core::AttemptSubject::Resolver {
+                endpoint: std::net::SocketAddr::new(Ipv4Addr::new(192, 0, 2, 53).into(), 53),
+                query_name: "missing.example".into(),
+            },
+            kind: AttemptKind::DnsUdp { query_type },
+            timing: reach_core::AttemptTiming {
+                started_at: Duration::ZERO,
+                deadline_at: Duration::from_secs(2),
+                completed_at: Duration::from_millis(12),
+            },
+            outcome: AttemptOutcome::Dns(outcome),
+            provenance: provenance(),
+        }
+    }
+
+    #[test]
     fn name_resolution_is_never_called_system_dns() {
         let completed = timeout_then_icmp_result();
         let output = render(&completed, Theme::plain());
@@ -1070,7 +1615,30 @@ mod tests {
         let negative = CompletedDiagnostic::new(
             parse_request("missing.invalid", None).expect("valid request"),
             synthetic_snapshot(),
-            None,
+            Some(reach_core::SystemResolverObservation {
+                started_at: Duration::ZERO,
+                completed_at: Duration::from_millis(1),
+                name_resolution: reach_core::NameResolutionObservation {
+                    input_name: "missing.invalid".into(),
+                    steps: vec![reach_core::NameResolutionStep {
+                        source: NameResolutionSource::SystemResolverOpaque,
+                        query_names: Vec::new(),
+                        dns_exchanges: Vec::new(),
+                        outcome: reach_core::NameResolutionStepOutcome::NotFound,
+                        provenance: provenance(),
+                    }],
+                    limitations: vec![
+                        "the exact formal DNS server identity selected by the platform system resolver is not exposed by the selected ordinary-user API"
+                            .into(),
+                    ],
+                    result: reach_core::SystemResolverResult::Failed(reach_core::SystemResolverFailure {
+                        kind: reach_core::SystemResolverFailureKind::NoUsableAddress,
+                        platform_code: Some(11_001),
+                        platform_message: "synthetic negative".into(),
+                    }),
+                },
+                provenance: provenance(),
+            }),
             HostnameResolutionOutcome::NegativeWithoutUsableAddress {
                 platform_code: Some(11_001),
             },
@@ -1080,14 +1648,22 @@ mod tests {
                 id: EvidenceId(1),
                 subject: EvidenceSubject::Hostname,
                 role: EvidenceRole::PrimaryDecision,
-                fact: EvidenceFact::SystemResolverResult("negative without an address".into()),
+                fact: EvidenceFact::NameResolution(reach_core::NameResolutionEvidence {
+                    outcome: NameResolutionEvidenceOutcome::NegativeWithoutUsableAddress,
+                }),
             }],
         );
         let output = render(&negative, Theme::plain());
         assert!(output.starts_with("× NO USABLE IP ADDRESS\n"));
         assert!(output.contains("System name resolution"));
-        assert!(output.contains("Name resolution: returned no usable IPv4 or IPv6 address"));
+        assert!(output.contains("NAME RESOLUTION"));
+        assert!(output.contains("Requested test"));
+        assert!(output.contains("Not started"));
+        assert!(output.contains("Not exposed by this platform"));
+        assert!(output.contains("The hostname did not resolve to an IP address"));
+        assert!(output.contains("No ICMP or TCP check was started"));
         assert!(!output.contains("does not exist"));
+        assert!(!output.contains("Any direct DNS evidence"));
         assert!(!output.to_ascii_lowercase().contains("system dns"));
     }
 
@@ -1126,7 +1702,7 @@ mod tests {
             native_status: Some(IcmpNativeStatus::WindowsIpHelper(0)),
         });
         let rendered = friendly_attempt_outcome(&outcome);
-        assert_eq!(rendered, "ICMP Echo Reply from 127.0.0.1");
+        assert_eq!(rendered, "Reply from 127.0.0.1");
         assert!(!rendered.contains("raw"));
         assert!(!rendered.contains("status"));
     }
@@ -1158,7 +1734,7 @@ mod tests {
         let rendered = attempt_evidence_summary(&attempt, Some(1));
         assert_eq!(
             rendered,
-            "TCP connect #1: No result before the 5s deadline."
+            "TCP connect #1: No result before the 5 s deadline."
         );
         assert!(!rendered.contains("5s 16ms"));
         assert!(!rendered.contains("/ 5s"));

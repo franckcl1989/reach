@@ -10,21 +10,22 @@ use gai_core::{
     sim::SourceResolver,
     simulate,
 };
-#[cfg(target_os = "linux")]
-use hickory_resolver::{
-    Resolver,
-    config::{LookupIpStrategy, ResolveHosts, ServerOrderingStrategy},
-    net::runtime::TokioRuntimeProvider,
-};
 #[cfg(not(target_os = "linux"))]
 use reach_core::InterfaceId;
 use reach_core::{
-    Hostname, Provenance, ProvenanceSource, ResolverAddressSet, SystemResolverFailure,
-    SystemResolverFailureKind, SystemResolverObservation, SystemResolverResult, TargetIp,
+    Hostname, NameResolutionObservation, NameResolutionSource, NameResolutionStep,
+    NameResolutionStepOutcome, Provenance, ProvenanceSource, ResolverAddressSet,
+    SystemResolverFailure, SystemResolverFailureKind, SystemResolverObservation,
+    SystemResolverResult, TargetIp,
 };
+#[cfg(target_os = "linux")]
+use resolv_conf::ScopedIp;
 use tokio_util::sync::CancellationToken;
 
 use crate::{ContinuousClock, PlatformError};
+
+#[cfg(target_os = "linux")]
+use crate::formal_dns::{FormalDnsConfig, FormalDnsStepOutcome, formal_dns_lookup};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemResolverAdapter;
@@ -46,11 +47,13 @@ impl SystemResolverAdapter {
         }
         let started_at = clock.now()?;
         let hostname = hostname.ascii().to_owned();
+        let worker_cancellation = cancellation.clone();
+        let worker_hostname = hostname.clone();
         let (sender, worker) = tokio::sync::oneshot::channel();
         let worker_thread = std::thread::Builder::new()
             .name("reach-system-resolver".into())
             .spawn(move || {
-                let _ = sender.send(system_lookup(&hostname));
+                let _ = sender.send(system_lookup(&worker_hostname, &worker_cancellation));
             });
         if let Err(error) = worker_thread {
             return if crate::is_resource_exhaustion(&error) {
@@ -62,11 +65,25 @@ impl SystemResolverAdapter {
 
         let result = await_worker(worker, cancellation).await?;
         let completed_at = clock.now()?;
-        let result = match result {
-            Ok(raw_addresses) => {
-                SystemResolverResult::Succeeded(ResolverAddressSet::from_raw(raw_addresses))
-            }
-            Err(ResolverWorkerError::Resolution(failure)) => SystemResolverResult::Failed(failure),
+        let name_resolution = match result {
+            Ok(name_resolution) => name_resolution,
+            #[cfg(any(not(target_os = "linux"), test))]
+            Err(ResolverWorkerError::Resolution(failure)) => NameResolutionObservation {
+                input_name: hostname,
+                steps: vec![NameResolutionStep {
+                    source: NameResolutionSource::Unknown,
+                    query_names: Vec::new(),
+                    dns_exchanges: Vec::new(),
+                    outcome: NameResolutionStepOutcome::Unavailable {
+                        reason: failure.platform_message.clone(),
+                    },
+                    provenance: Provenance::new(ProvenanceSource::SystemResolver)
+                        .at(completed_at)
+                        .with_detail("resolution failed before any source step completed"),
+                }],
+                limitations: Vec::new(),
+                result: SystemResolverResult::Failed(failure),
+            },
             #[cfg(target_os = "linux")]
             Err(ResolverWorkerError::CapabilityUnavailable(message)) => {
                 return Err(PlatformError::NameResolutionCapabilityUnavailable(message));
@@ -78,14 +95,14 @@ impl SystemResolverAdapter {
         };
 
         #[cfg(target_os = "linux")]
-        let detail = "self-contained Linux resolver; gai-core NSS order/action simulation with /etc/hosts and hickory-resolver DNS using /etc/resolv.conf; unsupported policy on the executed path is a required-capability error";
+        let detail = "self-contained Linux resolver; gai-core NSS order/action simulation with /etc/hosts and the bounded Reach formal DNS client over /etc/resolv.conf; unsupported policy on the executed path is a required-capability error";
         #[cfg(not(target_os = "linux"))]
-        let detail = "dns-lookup getaddrinfo on a detached OS thread; one call, no product timeout or retry; cancellation does not wait for an uninterruptible OS lookup";
+        let detail = "dns-lookup getaddrinfo on a detached OS thread; one call, no product timeout or retry; the exact formal DNS server identity is not exposed by this ordinary-user API";
 
         Ok(SystemResolverObservation {
             started_at,
             completed_at,
-            result,
+            name_resolution,
             provenance: Provenance::new(ProvenanceSource::SystemResolver)
                 .at(completed_at)
                 .with_detail(detail),
@@ -94,9 +111,9 @@ impl SystemResolverAdapter {
 }
 
 async fn await_worker(
-    worker: tokio::sync::oneshot::Receiver<Result<Vec<TargetIp>, ResolverWorkerError>>,
+    worker: tokio::sync::oneshot::Receiver<Result<NameResolutionObservation, ResolverWorkerError>>,
     cancellation: &CancellationToken,
-) -> Result<Result<Vec<TargetIp>, ResolverWorkerError>, PlatformError> {
+) -> Result<Result<NameResolutionObservation, ResolverWorkerError>, PlatformError> {
     tokio::select! {
         biased;
         () = cancellation.cancelled() => Err(PlatformError::OperationCancelled),
@@ -107,7 +124,10 @@ async fn await_worker(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn system_lookup(hostname: &str) -> Result<Vec<TargetIp>, ResolverWorkerError> {
+fn system_lookup(
+    hostname: &str,
+    _cancellation: &CancellationToken,
+) -> Result<NameResolutionObservation, ResolverWorkerError> {
     let hints = AddrInfoHints {
         socktype: SockType::Stream.into(),
         ..AddrInfoHints::default()
@@ -127,7 +147,7 @@ fn system_lookup(hostname: &str) -> Result<Vec<TargetIp>, ResolverWorkerError> {
         }
     })?;
 
-    records
+    let addresses = records
         .map(|record| record.map(|record| target_from_socket_address(record.sockaddr)))
         .collect::<io::Result<Vec<_>>>()
         .map_err(|error| {
@@ -140,27 +160,65 @@ fn system_lookup(hostname: &str) -> Result<Vec<TargetIp>, ResolverWorkerError> {
                     platform_message: error.to_string(),
                 })
             }
-        })
+        })?;
+
+    let limitation =
+        "the exact formal DNS server identity selected by the platform system resolver is not exposed by the selected ordinary-user API"
+            .to_owned();
+    let steps = vec![NameResolutionStep {
+        source: NameResolutionSource::SystemResolverOpaque,
+        query_names: Vec::new(),
+        dns_exchanges: Vec::new(),
+        outcome: if addresses.is_empty() {
+            NameResolutionStepOutcome::NotFound
+        } else {
+            NameResolutionStepOutcome::Found
+        },
+        provenance: Provenance::new(ProvenanceSource::SystemResolver)
+            .with_detail("opaque platform system resolver step"),
+    }];
+    Ok(NameResolutionObservation {
+        input_name: hostname.to_owned(),
+        steps,
+        limitations: vec![limitation],
+        result: SystemResolverResult::Succeeded(ResolverAddressSet::from_raw(addresses)),
+    })
 }
 
 #[cfg(target_os = "linux")]
-fn system_lookup(hostname: &str) -> Result<Vec<TargetIp>, ResolverWorkerError> {
-    linux_lookup_with_paths(
+fn system_lookup(
+    hostname: &str,
+    cancellation: &CancellationToken,
+) -> Result<NameResolutionObservation, ResolverWorkerError> {
+    linux_lookup_with_paths_and_dns_port(
         hostname,
         std::path::Path::new("/etc/nsswitch.conf"),
         std::path::Path::new("/etc/hosts"),
         std::path::Path::new("/etc/resolv.conf"),
+        None,
+        cancellation,
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn linux_lookup_with_paths(
     hostname: &str,
     nsswitch_path: &std::path::Path,
     hosts_path: &std::path::Path,
     resolv_path: &std::path::Path,
 ) -> Result<Vec<TargetIp>, ResolverWorkerError> {
-    linux_lookup_with_paths_and_dns_port(hostname, nsswitch_path, hosts_path, resolv_path, None)
+    let observation = linux_lookup_with_paths_and_dns_port(
+        hostname,
+        nsswitch_path,
+        hosts_path,
+        resolv_path,
+        None,
+        &CancellationToken::new(),
+    )?;
+    match observation.result {
+        SystemResolverResult::Succeeded(addresses) => Ok(addresses.raw_addresses),
+        SystemResolverResult::Failed(failure) => Err(ResolverWorkerError::Resolution(failure)),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -170,7 +228,8 @@ fn linux_lookup_with_paths_and_dns_port(
     hosts_path: &std::path::Path,
     resolv_path: &std::path::Path,
     dns_port_override: Option<u16>,
-) -> Result<Vec<TargetIp>, ResolverWorkerError> {
+    cancellation: &CancellationToken,
+) -> Result<NameResolutionObservation, ResolverWorkerError> {
     let policy = parse_nsswitch(nsswitch_path).map_err(capability_error)?;
     if policy.hosts.is_empty() {
         return Err(capability_error(format!(
@@ -179,37 +238,62 @@ fn linux_lookup_with_paths_and_dns_port(
         )));
     }
     let hosts = parse_hosts(hosts_path).map_err(capability_error)?;
-    let mut source_resolver =
-        LinuxSourceResolver::new(&policy.hosts, hosts, resolv_path, dns_port_override);
+    let mut source_resolver = LinuxSourceResolver::new(
+        &policy.hosts,
+        hosts,
+        resolv_path,
+        dns_port_override,
+        cancellation.clone(),
+    );
     let outcome = simulate(&policy, hostname, &mut source_resolver);
     if let Some(message) = source_resolver.capability_failure {
         return Err(capability_error(message));
     }
-    if outcome.final_addresses.is_empty() {
+    let result = if outcome.final_addresses.is_empty() {
         if let Some(message) = source_resolver.resolution_failure {
-            return Err(ResolverWorkerError::Resolution(SystemResolverFailure {
+            SystemResolverResult::Failed(SystemResolverFailure {
                 kind: SystemResolverFailureKind::ResolverFailure,
                 platform_code: None,
                 platform_message: message,
-            }));
+            })
+        } else {
+            SystemResolverResult::Failed(SystemResolverFailure {
+                kind: SystemResolverFailureKind::NoUsableAddress,
+                platform_code: None,
+                platform_message:
+                    "the executed Linux NSS policy returned no usable IPv4 or IPv6 address".into(),
+            })
         }
-        return Err(ResolverWorkerError::Resolution(SystemResolverFailure {
-            kind: SystemResolverFailureKind::NoUsableAddress,
-            platform_code: None,
-            platform_message:
-                "the executed Linux NSS policy returned no usable IPv4 or IPv6 address".into(),
-        }));
-    }
-    Ok(outcome
-        .final_addresses
+    } else {
+        SystemResolverResult::Succeeded(ResolverAddressSet::from_raw(
+            outcome
+                .final_addresses
+                .into_iter()
+                .map(target_from_ip_address)
+                .collect(),
+        ))
+    };
+    let steps = source_resolver
+        .steps
         .into_iter()
-        .map(target_from_ip_address)
-        .collect())
+        .map(|recorded| recorded.step)
+        .collect();
+    Ok(NameResolutionObservation {
+        input_name: hostname.to_owned(),
+        steps,
+        limitations: Vec::new(),
+        result,
+    })
 }
 
 #[cfg(target_os = "linux")]
 fn capability_error(message: impl std::fmt::Display) -> ResolverWorkerError {
     ResolverWorkerError::CapabilityUnavailable(message.to_string())
+}
+
+#[cfg(target_os = "linux")]
+struct RecordedStep {
+    step: NameResolutionStep,
 }
 
 #[cfg(target_os = "linux")]
@@ -220,9 +304,11 @@ struct LinuxSourceResolver<'a> {
     cursor: usize,
     capability_failure: Option<String>,
     resolution_failure: Option<String>,
+    cancellation: CancellationToken,
     runtime: Option<tokio::runtime::Runtime>,
-    dns: Option<hickory_resolver::TokioResolver>,
+    dns_config: Option<FormalDnsConfig>,
     dns_port_override: Option<u16>,
+    steps: Vec<RecordedStep>,
 }
 
 #[cfg(target_os = "linux")]
@@ -232,6 +318,7 @@ impl<'a> LinuxSourceResolver<'a> {
         hosts: Vec<gai_core::HostsEntry>,
         resolv_path: &'a std::path::Path,
         dns_port_override: Option<u16>,
+        cancellation: CancellationToken,
     ) -> Self {
         Self {
             policy,
@@ -240,9 +327,11 @@ impl<'a> LinuxSourceResolver<'a> {
             cursor: 0,
             capability_failure: None,
             resolution_failure: None,
+            cancellation,
             runtime: None,
-            dns: None,
+            dns_config: None,
             dns_port_override,
+            steps: Vec::new(),
         }
     }
 
@@ -253,7 +342,26 @@ impl<'a> LinuxSourceResolver<'a> {
         StepResult::Skipped { reason: message }
     }
 
-    fn lookup_files(&self, name: &str) -> StepResult {
+    fn record(
+        &mut self,
+        source: NameResolutionSource,
+        query_names: Vec<String>,
+        exchanges: Vec<reach_core::DnsExchangeObservation>,
+        outcome: NameResolutionStepOutcome,
+    ) {
+        self.steps.push(RecordedStep {
+            step: NameResolutionStep {
+                source,
+                query_names,
+                dns_exchanges: exchanges,
+                outcome,
+                provenance: Provenance::new(ProvenanceSource::SystemResolver)
+                    .with_detail("executed Linux NSS hosts-policy step"),
+            },
+        });
+    }
+
+    fn lookup_files(&mut self, name: &str) -> StepResult {
         let query = name.trim_end_matches('.');
         let addresses =
             self.hosts
@@ -266,8 +374,20 @@ impl<'a> LinuxSourceResolver<'a> {
                 .map(|entry| entry.ip)
                 .collect::<Vec<_>>();
         if addresses.is_empty() {
+            self.record(
+                NameResolutionSource::Hosts,
+                Vec::new(),
+                Vec::new(),
+                NameResolutionStepOutcome::NotFound,
+            );
             StepResult::NotFound
         } else {
+            self.record(
+                NameResolutionSource::Hosts,
+                Vec::new(),
+                Vec::new(),
+                NameResolutionStepOutcome::Found,
+            );
             StepResult::Found(addresses)
         }
     }
@@ -283,7 +403,7 @@ impl<'a> LinuxSourceResolver<'a> {
                     .into(),
             );
         }
-        if self.dns.is_some() {
+        if self.dns_config.is_some() {
             return Ok(());
         }
         let bytes = std::fs::read(self.resolv_path)
@@ -291,36 +411,42 @@ impl<'a> LinuxSourceResolver<'a> {
         let parsed = resolv_conf::Config::parse(&bytes)
             .map_err(|error| format!("cannot parse {}: {error}", self.resolv_path.display()))?;
         validate_resolv_options(&parsed)?;
-        let (config, mut options) = hickory_resolver::system_conf::parse_resolv_conf(&bytes)
-            .map_err(|error| format!("cannot apply {}: {error}", self.resolv_path.display()))?;
-        let config = if let Some(port) = self.dns_port_override {
-            let (domain, search, mut name_servers) = config.into_parts();
-            for name_server in &mut name_servers {
-                for connection in &mut name_server.connections {
-                    connection.port = port;
+        let port = self.dns_port_override.unwrap_or(53);
+        let mut servers = Vec::with_capacity(parsed.nameservers.len());
+        for server in &parsed.nameservers {
+            match server {
+                ScopedIp::V4(address) => servers.push(((*address).into(), port)),
+                ScopedIp::V6(address, None) => servers.push(((*address).into(), port)),
+                ScopedIp::V6(_, Some(scope)) => {
+                    return Err(format!(
+                        "scoped IPv6 nameserver scope {scope} requires interface binding that the self-contained formal resolver cannot verify"
+                    ));
                 }
             }
-            hickory_resolver::config::ResolverConfig::from_parts(domain, search, name_servers)
+        }
+        let timeout = if parsed.timeout == 0 {
+            5
         } else {
-            config
+            parsed.timeout
         };
-        options.use_hosts_file = ResolveHosts::Never;
-        options.ip_strategy = if parsed.inet6 {
-            LookupIpStrategy::Ipv6AndIpv4
+        let attempts = if parsed.attempts == 0 {
+            2
         } else {
-            LookupIpStrategy::Ipv4AndIpv6
+            parsed.attempts
         };
-        options.server_ordering_strategy = ServerOrderingStrategy::UserProvidedOrder;
-        options.num_concurrent_reqs = 1;
-        let resolver = Resolver::builder_with_config(config, TokioRuntimeProvider::default())
-            .with_options(options)
-            .build()
-            .map_err(|error| format!("cannot initialize DNS source: {error}"))?;
+        let search = parsed.get_last_search_or_domain().cloned().collect();
+        let dns_config = FormalDnsConfig {
+            servers,
+            search,
+            ndots: parsed.ndots,
+            timeout: std::time::Duration::from_secs(u64::from(timeout)),
+            attempts,
+        };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| format!("cannot initialize DNS runtime: {error}"))?;
-        self.dns = Some(resolver);
+        self.dns_config = Some(dns_config);
         self.runtime = Some(runtime);
         Ok(())
     }
@@ -329,23 +455,59 @@ impl<'a> LinuxSourceResolver<'a> {
         if let Err(message) = self.prepare_dns(entry) {
             return self.fail(message);
         }
-        let (Some(runtime), Some(resolver)) = (&self.runtime, &self.dns) else {
+        let (Some(runtime), Some(config)) = (&self.runtime, &self.dns_config) else {
             return self.fail("DNS source was not initialized");
         };
-        match runtime.block_on(resolver.lookup_ip(name)) {
-            Ok(lookup) => {
-                let addresses = lookup.iter().collect::<Vec<_>>();
-                if addresses.is_empty() {
-                    StepResult::NotFound
-                } else {
-                    StepResult::Found(addresses)
-                }
+        let outcome = runtime.block_on(formal_dns_lookup(
+            name,
+            config,
+            &self.cancellation,
+            &crate::SystemContinuousClock,
+        ));
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(PlatformError::OperationCancelled) => {
+                self.resolution_failure = Some("interrupted".into());
+                return StepResult::Skipped {
+                    reason: "interrupted".into(),
+                };
             }
-            Err(error) if error.is_no_records_found() => StepResult::NotFound,
             Err(error) => {
                 let message = format!("DNS source failed: {error}");
                 self.resolution_failure = Some(message.clone());
-                StepResult::Skipped { reason: message }
+                return StepResult::Skipped { reason: message };
+            }
+        };
+        match outcome.outcome {
+            FormalDnsStepOutcome::Found(addresses) => {
+                self.record(
+                    NameResolutionSource::Dns,
+                    outcome.query_names,
+                    outcome.exchanges,
+                    NameResolutionStepOutcome::Found,
+                );
+                StepResult::Found(addresses)
+            }
+            FormalDnsStepOutcome::NotFound => {
+                self.record(
+                    NameResolutionSource::Dns,
+                    outcome.query_names,
+                    outcome.exchanges,
+                    NameResolutionStepOutcome::NotFound,
+                );
+                StepResult::NotFound
+            }
+            FormalDnsStepOutcome::Unavailable(reason) => {
+                self.record(
+                    NameResolutionSource::Dns,
+                    outcome.query_names,
+                    outcome.exchanges,
+                    NameResolutionStepOutcome::Unavailable {
+                        reason: reason.clone(),
+                    },
+                );
+                self.resolution_failure = Some(reason.clone());
+                StepResult::Skipped { reason }
             }
         }
     }
@@ -412,6 +574,7 @@ fn validate_resolv_options(config: &resolv_conf::Config) -> Result<(), String> {
 
 #[derive(Debug)]
 enum ResolverWorkerError {
+    #[cfg(any(not(target_os = "linux"), test))]
     Resolution(SystemResolverFailure),
     #[cfg(target_os = "linux")]
     CapabilityUnavailable(String),
@@ -497,17 +660,18 @@ mod tests {
             )
         }
 
-        fn resolve_with_dns_port(
+        fn observe(
             &self,
             name: &str,
             port: u16,
-        ) -> Result<Vec<TargetIp>, ResolverWorkerError> {
+        ) -> Result<NameResolutionObservation, ResolverWorkerError> {
             linux_lookup_with_paths_and_dns_port(
                 name,
                 &self.directory.path().join("nsswitch.conf"),
                 &self.directory.path().join("hosts"),
                 &self.directory.path().join("resolv.conf"),
                 Some(port),
+                &CancellationToken::new(),
             )
         }
     }
@@ -531,6 +695,31 @@ mod tests {
                 TargetIp::v4("192.0.2.20".parse().expect("IPv4")),
             ]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn files_hit_records_hosts_source_without_any_dns_claim() {
+        let fixture = LinuxFixture::new(
+            "hosts: files dns\n",
+            "192.0.2.20 admin\n",
+            "nameserver 192.0.2.53\n",
+        );
+        let observation = fixture
+            .observe("admin", 53)
+            .expect("files must terminate first");
+        assert_eq!(observation.steps.len(), 1);
+        assert_eq!(observation.steps[0].source, NameResolutionSource::Hosts);
+        assert!(observation.steps[0].dns_exchanges.is_empty());
+        assert!(observation.steps[0].query_names.is_empty());
+        assert_eq!(
+            observation.steps[0].outcome,
+            NameResolutionStepOutcome::Found
+        );
+        assert!(matches!(
+            observation.result,
+            SystemResolverResult::Succeeded(_)
+        ));
     }
 
     #[cfg(target_os = "linux")]
@@ -585,15 +774,10 @@ mod tests {
     #[test]
     fn selected_resolv_parser_retains_search_domain_and_ndots() {
         let bytes = b"nameserver 192.0.2.53\nsearch corp.example\noptions ndots:2\n";
-        let (config, options) = hickory_resolver::system_conf::parse_resolv_conf(bytes)
-            .expect("supported resolver config");
-        assert_eq!(options.ndots, 2);
+        let config = resolv_conf::Config::parse(bytes).expect("supported resolver config");
+        assert_eq!(config.ndots, 2);
         assert_eq!(
-            config
-                .search()
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
+            config.get_last_search_or_domain().collect::<Vec<_>>(),
             vec!["corp.example"]
         );
     }
@@ -649,10 +833,10 @@ mod tests {
             "nameserver 127.0.0.1\nsearch corp.example\noptions ndots:1 timeout:1 attempts:1\n",
         );
         let searched = fixture
-            .resolve_with_dns_port("admin", dns_port)
+            .observe("admin", dns_port)
             .expect("search-domain lookup");
         let absolute = fixture
-            .resolve_with_dns_port("admin.", dns_port)
+            .observe("admin.", dns_port)
             .expect("absolute lookup");
         server.join().expect("DNS fixture thread");
 
@@ -660,11 +844,84 @@ mod tests {
             TargetIp::v4(std::net::Ipv4Addr::new(192, 0, 2, 53)),
             TargetIp::v4(std::net::Ipv4Addr::new(192, 0, 2, 53)),
         ];
-        assert_eq!(searched, expected);
-        assert_eq!(absolute, expected);
+        let SystemResolverResult::Succeeded(searched_addresses) = searched.result else {
+            panic!("search-domain lookup must resolve");
+        };
+        let SystemResolverResult::Succeeded(absolute_addresses) = absolute.result else {
+            panic!("absolute lookup must resolve");
+        };
+        assert_eq!(searched_addresses.raw_addresses, expected);
+        assert_eq!(absolute_addresses.raw_addresses, expected);
         let names = observed_names.lock().expect("query-name lock");
         assert!(names.iter().any(|name| name == "admin.corp.example."));
         assert!(names.iter().any(|name| name == "admin."));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dns_negative_result_records_the_actual_server_and_nxdomain() {
+        use std::sync::{Arc, Mutex};
+
+        use hickory_proto::op::{Message, OpCode, ResponseCode};
+
+        let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("ordinary-user local DNS fixture on an ephemeral port");
+        let dns_port = socket.local_addr().expect("DNS fixture address").port();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("DNS fixture timeout");
+        let queries = Arc::new(Mutex::new(0_usize));
+        let server_queries = queries.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let mut wire = [0_u8; 2048];
+                let (length, peer) = socket.recv_from(&mut wire).expect("receive DNS query");
+                let query = Message::from_vec(&wire[..length]).expect("decode DNS query");
+                *server_queries.lock().expect("query lock") += 1;
+                let mut response = Message::response(query.metadata.id, OpCode::Query);
+                response.queries = query.queries.clone();
+                response.metadata.response_code = ResponseCode::NXDomain;
+                socket
+                    .send_to(&response.to_vec().expect("encode DNS response"), peer)
+                    .expect("send DNS response");
+            }
+        });
+
+        let fixture = LinuxFixture::new(
+            "hosts: files dns\n",
+            "127.0.0.1 localhost\n",
+            "nameserver 127.0.0.1\noptions ndots:1 timeout:1 attempts:1\n",
+        );
+        let observation = fixture
+            .observe("tt-gzb.eqfleetcmder.com", dns_port)
+            .expect("negative DNS result must complete as a resolution failure");
+        server.join().expect("DNS fixture thread");
+
+        let SystemResolverResult::Failed(failure) = observation.result else {
+            panic!("negative DNS result must fail");
+        };
+        assert_eq!(failure.kind, SystemResolverFailureKind::NoUsableAddress);
+        assert_eq!(observation.steps.len(), 2);
+        assert_eq!(observation.steps[0].source, NameResolutionSource::Hosts);
+        let dns_step = &observation.steps[1];
+        assert_eq!(dns_step.source, NameResolutionSource::Dns);
+        assert_eq!(dns_step.query_names, vec!["tt-gzb.eqfleetcmder.com"]);
+        assert_eq!(dns_step.dns_exchanges.len(), 2);
+        for exchange in &dns_step.dns_exchanges {
+            assert_eq!(exchange.endpoint.port, dns_port);
+            assert_eq!(
+                exchange.endpoint.address,
+                "127.0.0.1".parse::<std::net::IpAddr>().expect("IPv4")
+            );
+            assert!(matches!(
+                exchange.outcome,
+                reach_core::DnsExchangeOutcome::Response {
+                    response_code: reach_core::DnsResponseCode::NxDomain,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(*queries.lock().expect("query lock"), 2);
     }
 
     #[cfg(target_os = "linux")]
@@ -680,6 +937,23 @@ mod tests {
             let error = validate_resolv_options(&config).expect_err("unsupported option");
             assert!(error.contains(option));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_ipv6_nameserver_is_a_capability_boundary_not_a_silent_substitution() {
+        let fixture = LinuxFixture::new(
+            "hosts: files dns\n",
+            "127.0.0.1 localhost\n",
+            "nameserver fe80::1%eth0\noptions ndots:1 timeout:1 attempts:1\n",
+        );
+        let error = fixture
+            .resolve("example.com")
+            .expect_err("scoped nameserver must fail closed");
+        let ResolverWorkerError::CapabilityUnavailable(message) = error else {
+            panic!("expected required capability failure");
+        };
+        assert!(message.contains("fe80"));
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -720,7 +994,7 @@ mod tests {
             )
             .await
             .expect("ordinary-user system resolver call must execute");
-        let SystemResolverResult::Succeeded(addresses) = observation.result else {
+        let SystemResolverResult::Succeeded(addresses) = observation.name_resolution.result else {
             panic!("localhost must resolve through the system policy: {observation:?}");
         };
         assert!(!addresses.raw_addresses.is_empty());

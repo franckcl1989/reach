@@ -105,14 +105,41 @@ pub enum EvidenceFact {
         before: NeighborObservation,
         after: crate::NeighborState,
     },
-    SystemResolverResult(String),
-    DirectDnsResult(String),
+    NameResolution(NameResolutionEvidence),
+    DnsExchange(DnsExchangeEvidence),
     CapabilityUnavailable {
         capability: String,
         reason: CapabilityReason,
     },
     SnapshotInconsistency(String),
     SocketPathComparison(String),
+}
+
+/// Typed summary of the system name-resolution result. Wording stays with the
+/// renderer; Core owns the meaning.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NameResolutionEvidence {
+    pub outcome: NameResolutionEvidenceOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NameResolutionEvidenceOutcome {
+    Succeeded {
+        raw_addresses: usize,
+        formal_targets: usize,
+    },
+    SucceededWithoutUsableAddress,
+    NegativeWithoutUsableAddress,
+    NonDefinitiveFailure,
+}
+
+/// A DNS exchange retained as evidence. Formal exchanges embed the structured
+/// observation; diagnostic exchanges reference the exact Attempt that carried
+/// them, so the purpose can never be confused by presentation ordering.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DnsExchangeEvidence {
+    Formal(crate::DnsExchangeObservation),
+    Diagnostic(AttemptId),
 }
 
 /// Whether the pre-operation Neighbor fact was sampled and what that sample

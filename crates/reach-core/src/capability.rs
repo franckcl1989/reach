@@ -45,6 +45,7 @@ pub enum ProvenanceSource {
     TcpSocket,
     IcmpApi,
     DirectDns,
+    FormalDns,
     PlatformCapabilityProbe,
     SyntheticTest,
 }

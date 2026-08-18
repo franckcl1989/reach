@@ -21,7 +21,6 @@ surge-ping.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 futures-util.workspace = true
 gai-core.workspace = true
-hickory-resolver.workspace = true
 netlink-packet-route.workspace = true
 resolv-conf.workspace = true
 rtnetlink.workspace = true

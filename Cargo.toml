@@ -7,7 +7,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 publish = false
 
@@ -22,7 +22,6 @@ dns-lookup = "3.0.1"
 futures-util = "0.3.32"
 gai-core = "0.5.1"
 hickory-proto = { version = "0.26.1", default-features = false, features = ["std"] }
-hickory-resolver = { version = "0.26.1", default-features = false, features = ["system-config", "tokio"] }
 hostname-validator = "1.1.1"
 humantime = "2.3.0"
 idna = "1.1.0"

@@ -25,14 +25,17 @@ pub use io::{
 };
 pub use model::{
     AddressFamily, Attempt, AttemptId, AttemptKind, AttemptOutcome, AttemptSubject, AttemptTiming,
-    DnsAttemptResult, DnsQueryType, FormalTarget, IcmpAttemptResult, IcmpMessageKind,
-    IcmpMessageObservation, IcmpNativeStatus, InitialNetworkSnapshot, InterfaceAddress,
-    InterfaceFact, InterfaceId, InterfaceState, IpEndpoint, NeighborFact, NeighborIdentity,
-    NeighborState, OperationPathContext, PathRelation, PathSelectionFact, ResolverAddressSet,
-    ResolverConfiguration, ResolverEndpoint, ResolverTransport, RouteBehavior, RouteFact,
-    RoutingPolicyFacts, SnapshotInconsistency, SnapshotInconsistencyScope, SystemResolverFailure,
-    SystemResolverFailureKind, SystemResolverObservation, SystemResolverResult, TargetIp,
-    TcpAttemptResult, stable_deduplicate_targets,
+    DnsAttemptResult, DnsExchangeObservation, DnsExchangeOutcome, DnsExchangePurpose,
+    DnsExchangeTransport, DnsQueryType, DnsResponseCode, FormalTarget, IcmpAttemptResult,
+    IcmpMessageKind, IcmpMessageObservation, IcmpNativeStatus, InitialNetworkSnapshot,
+    InterfaceAddress, InterfaceFact, InterfaceId, InterfaceState, IpEndpoint,
+    NameResolutionObservation, NameResolutionSource, NameResolutionStep, NameResolutionStepOutcome,
+    NeighborFact, NeighborIdentity, NeighborState, OperationPathContext, PathRelation,
+    PathSelectionFact, ResolverAddressSet, ResolverConfiguration, ResolverEndpoint,
+    ResolverTransport, RouteBehavior, RouteFact, RoutingPolicyFacts, SnapshotInconsistency,
+    SnapshotInconsistencyScope, SystemResolverFailure, SystemResolverFailureKind,
+    SystemResolverObservation, SystemResolverResult, TargetIp, TcpAttemptResult,
+    stable_deduplicate_targets,
 };
 pub use path::{
     InitialPathAnalysis, InitialPathStatus, NeighborDependency, analyze_initial_path,
@@ -44,8 +47,9 @@ pub use policy::{
     TARGET_ICMP_BUDGET, TCP_CONNECT_BUDGET,
 };
 pub use result::{
-    AggregateOutcome, Cancelled, CompletedDiagnostic, Conclusion, DiagnosticResult, Evidence,
-    EvidenceFact, EvidenceId, EvidenceRole, EvidenceSubject, ExecutionError, ExecutionErrorKind,
-    ExitStatus, HostnameResolutionOutcome, NeighborObservation, PrimaryOutcome,
+    AggregateOutcome, Cancelled, CompletedDiagnostic, Conclusion, DiagnosticResult,
+    DnsExchangeEvidence, Evidence, EvidenceFact, EvidenceId, EvidenceRole, EvidenceSubject,
+    ExecutionError, ExecutionErrorKind, ExitStatus, HostnameResolutionOutcome,
+    NameResolutionEvidence, NameResolutionEvidenceOutcome, NeighborObservation, PrimaryOutcome,
     ResolverDependencyDiagnostic, TargetDiagnostic, TargetNetworkFacts, select_key_evidence,
 };

@@ -7,6 +7,9 @@
 mod adapter;
 mod clock;
 mod direct_dns;
+mod dns_wire;
+#[cfg(target_os = "linux")]
+mod formal_dns;
 mod icmp;
 mod interfaces;
 mod neighbor;

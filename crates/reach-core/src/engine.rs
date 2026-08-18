@@ -7,18 +7,19 @@ use crate::{
     Attempt, AttemptId, AttemptOutcome, AttemptSubject, BoundAddressInput, Cancelled,
     CapabilityReason, CapabilityValue, CompletedDiagnostic, Conclusion, DNS_TCP_BUDGET,
     DNS_UDP_BUDGET, DiagnosticIo, DiagnosticIoError, DiagnosticIoErrorKind, DiagnosticResult,
-    DirectDnsOperation, DirectDnsTransportReason, DnsAttemptResult, DnsQueryType, Evidence,
-    EvidenceFact, EvidenceId, EvidenceRole, EvidenceSubject, ExecutionError, ExecutionErrorKind,
-    FormalTarget, Hostname, HostnameResolutionOutcome, IcmpAttemptResult, IcmpEchoSubject,
-    IcmpMessageKind, IcmpOperation, InitialNetworkSnapshot, InitialPathAnalysis, InitialPathStatus,
-    MAX_ACTIVE_RESOLVERS, MAX_ACTIVE_TARGETS, MAX_PATH_HOP_LIMIT, NEXT_HOP_ICMP_BUDGET,
-    NeighborDependency, NeighborFact, NeighborIdentity, NeighborObservation, NeighborState,
-    OperationPathContext, PATH_ATTEMPT_BUDGET, ParsedRequest, PathOperation, PathRelation,
-    PrimaryOutcome, Provenance, ProvenanceSource, ResolverDependencyDiagnostic, ResolverEndpoint,
-    ResolverTransport, SnapshotInconsistencyScope, SystemResolverFailureKind,
-    SystemResolverObservation, SystemResolverResult, TARGET_ICMP_BUDGET, TCP_CONNECT_BUDGET,
-    TargetDiagnostic, TargetIp, TargetNetworkFacts, TcpAttemptResult, TcpOperation,
-    analyze_initial_path, bind_diagnostic_request, neighbor_dependency_for_path,
+    DirectDnsOperation, DirectDnsTransportReason, DnsAttemptResult, DnsExchangeEvidence,
+    DnsQueryType, Evidence, EvidenceFact, EvidenceId, EvidenceRole, EvidenceSubject,
+    ExecutionError, ExecutionErrorKind, FormalTarget, Hostname, HostnameResolutionOutcome,
+    IcmpAttemptResult, IcmpEchoSubject, IcmpMessageKind, IcmpOperation, InitialNetworkSnapshot,
+    InitialPathAnalysis, InitialPathStatus, MAX_ACTIVE_RESOLVERS, MAX_ACTIVE_TARGETS,
+    MAX_PATH_HOP_LIMIT, NEXT_HOP_ICMP_BUDGET, NameResolutionEvidence,
+    NameResolutionEvidenceOutcome, NeighborDependency, NeighborFact, NeighborIdentity,
+    NeighborObservation, NeighborState, OperationPathContext, PATH_ATTEMPT_BUDGET, ParsedRequest,
+    PathOperation, PathRelation, PrimaryOutcome, Provenance, ProvenanceSource,
+    ResolverDependencyDiagnostic, ResolverEndpoint, ResolverTransport, SnapshotInconsistencyScope,
+    SystemResolverFailureKind, SystemResolverObservation, SystemResolverResult, TARGET_ICMP_BUDGET,
+    TCP_CONNECT_BUDGET, TargetDiagnostic, TargetIp, TargetNetworkFacts, TcpAttemptResult,
+    TcpOperation, analyze_initial_path, bind_diagnostic_request, neighbor_dependency_for_path,
     reconcile_current_operation_path,
 };
 
@@ -65,7 +66,7 @@ pub async fn run_diagnostic(
                     Err(error) => return terminal_io_error(error, cancellation),
                 };
                 let evidence = vec![system_resolver_evidence(&observation)];
-                match &observation.result {
+                match &observation.name_resolution.result {
                     SystemResolverResult::Succeeded(addresses)
                         if addresses.formal_targets.is_empty() =>
                     {
@@ -109,27 +110,30 @@ pub async fn run_diagnostic(
 
     let mut resolver_diagnostics = Vec::new();
     if formal_targets.is_empty()
-        && matches!(
-            hostname_resolution,
-            HostnameResolutionOutcome::NonDefinitiveFailure { .. }
-        )
         && let BoundAddressInput::Hostname(hostname) = &request.address
+        && let Some(observation) = &system_resolver
     {
-        let diagnostic =
-            match diagnose_resolver_failure(hostname, &snapshot, io, cancellation).await {
-                Ok(diagnostic) => diagnostic,
-                Err(error) => return terminal_io_error(error, cancellation),
-            };
-        resolver_diagnostics = diagnostic.dependencies;
-        run_evidence.extend(diagnostic.evidence);
-        if let HostnameResolutionOutcome::NonDefinitiveFailure {
-            direct_dns_was_diagnostic_only,
-            ..
-        } = &mut hostname_resolution
-        {
-            *direct_dns_was_diagnostic_only = resolver_diagnostics
-                .iter()
-                .any(|diagnostic| !diagnostic.attempts.is_empty());
+        if formal_dns_consulted(observation) {
+            run_evidence.extend(formal_dns_evidence(observation));
+        } else if dns_diagnosis_applicable(observation, &snapshot) {
+            let diagnostic =
+                match diagnose_resolver_failure(hostname, &snapshot, io, cancellation).await {
+                    Ok(diagnostic) => diagnostic,
+                    Err(error) => return terminal_io_error(error, cancellation),
+                };
+            resolver_diagnostics = diagnostic.dependencies;
+            run_evidence.extend(diagnostic.evidence);
+            if let HostnameResolutionOutcome::NonDefinitiveFailure {
+                direct_dns_was_diagnostic_only,
+                ..
+            } = &mut hostname_resolution
+            {
+                *direct_dns_was_diagnostic_only = resolver_diagnostics
+                    .iter()
+                    .any(|diagnostic| !diagnostic.attempts.is_empty());
+            }
+        } else if let Some(evidence) = dns_diagnosis_limitation_evidence(observation, &snapshot) {
+            run_evidence.push(evidence);
         }
     }
 
@@ -574,12 +578,11 @@ async fn diagnose_resolver_candidate(
     let mut attempts = a?;
     attempts.extend(aaaa?);
     for attempt in &attempts {
-        let summary = direct_dns_evidence_summary(attempt)?;
         evidence.push(Evidence {
             id: EvidenceId(attempt.id.0),
             subject: EvidenceSubject::Resolver(resolver_label(&prepared.endpoint)),
             role: EvidenceRole::BoundaryNarrowing,
-            fact: EvidenceFact::DirectDnsResult(summary),
+            fact: EvidenceFact::DnsExchange(DnsExchangeEvidence::Diagnostic(attempt.id)),
         });
     }
     if !attempts.iter().any(is_dns_response) {
@@ -816,31 +819,140 @@ fn is_dns_response(attempt: &Attempt) -> bool {
     )
 }
 
-fn direct_dns_evidence_summary(attempt: &Attempt) -> Result<String, DiagnosticIoError> {
-    let AttemptOutcome::Dns(outcome) = &attempt.outcome else {
-        return Err(DiagnosticIoError::new(
-            DiagnosticIoErrorKind::Internal,
-            "platform adapter returned a non-DNS outcome for a direct-DNS Attempt",
-        ));
-    };
-    let outcome = match outcome {
-        DnsAttemptResult::Response {
-            response_code,
-            addresses,
-            aliases,
-            truncated,
-        } => format!(
-            "response code {response_code}, {} address(es), {} alias(es), truncated={truncated}",
-            addresses.len(),
-            aliases.len()
-        ),
-        DnsAttemptResult::TransportError { os_code } => {
-            format!("transport error (OS code {os_code:?})")
+fn system_resolver_evidence(observation: &SystemResolverObservation) -> Evidence {
+    let outcome = match &observation.name_resolution.result {
+        SystemResolverResult::Succeeded(addresses) if addresses.formal_targets.is_empty() => {
+            NameResolutionEvidenceOutcome::SucceededWithoutUsableAddress
         }
-        DnsAttemptResult::ProtocolError => "protocol error".into(),
-        DnsAttemptResult::Timeout => "timeout".into(),
+        SystemResolverResult::Succeeded(addresses) => NameResolutionEvidenceOutcome::Succeeded {
+            raw_addresses: addresses.raw_addresses.len(),
+            formal_targets: addresses.formal_targets.len(),
+        },
+        SystemResolverResult::Failed(failure) => {
+            if failure.kind == SystemResolverFailureKind::NoUsableAddress {
+                NameResolutionEvidenceOutcome::NegativeWithoutUsableAddress
+            } else {
+                NameResolutionEvidenceOutcome::NonDefinitiveFailure
+            }
+        }
     };
-    Ok(format!("{:?}: {outcome}", attempt.kind))
+    Evidence {
+        id: EvidenceId(1),
+        subject: EvidenceSubject::Hostname,
+        role: match &observation.name_resolution.result {
+            SystemResolverResult::Succeeded(addresses) if !addresses.formal_targets.is_empty() => {
+                EvidenceRole::Context
+            }
+            SystemResolverResult::Succeeded(_) | SystemResolverResult::Failed(_) => {
+                EvidenceRole::PrimaryDecision
+            }
+        },
+        fact: EvidenceFact::NameResolution(NameResolutionEvidence { outcome }),
+    }
+}
+
+/// Whether DNS failure diagnosis is semantically applicable for a hostname
+/// that produced no formal target. Either the formal resolution observably
+/// consulted DNS, or the captured resolver configuration establishes classic
+/// DNS candidates that can be probed without pretending to reproduce the
+/// unknown system resolver path.
+fn dns_diagnosis_applicable(
+    observation: &SystemResolverObservation,
+    snapshot: &InitialNetworkSnapshot,
+) -> bool {
+    if formal_dns_consulted(observation) {
+        return true;
+    }
+    let CapabilityValue::Available { value, .. } = &snapshot.resolver_configuration else {
+        return false;
+    };
+    matches!(
+        &value.dns_protocol_candidates_applicable,
+        CapabilityValue::Available { value: true, .. }
+    )
+}
+
+fn formal_dns_consulted(observation: &SystemResolverObservation) -> bool {
+    observation.name_resolution.steps.iter().any(|step| {
+        step.source == crate::NameResolutionSource::Dns && !step.dns_exchanges.is_empty()
+    })
+}
+
+/// Capability evidence for a no-formal-target hostname where DNS diagnosis is
+/// provably not applicable. This explains why no DNS diagnosis section exists
+/// without pretending that DNS was consulted.
+fn dns_diagnosis_limitation_evidence(
+    observation: &SystemResolverObservation,
+    snapshot: &InitialNetworkSnapshot,
+) -> Option<Evidence> {
+    if formal_dns_consulted(observation) {
+        return None;
+    }
+    let configuration = match &snapshot.resolver_configuration {
+        CapabilityValue::Available { value, .. } => value,
+        CapabilityValue::Unknown { reason, .. } | CapabilityValue::Unavailable { reason, .. } => {
+            return Some(Evidence {
+                id: EvidenceId(100),
+                subject: EvidenceSubject::Hostname,
+                role: EvidenceRole::CapabilityLimitation,
+                fact: EvidenceFact::CapabilityUnavailable {
+                    capability: "applicable resolver configuration".into(),
+                    reason: reason.clone(),
+                },
+            });
+        }
+    };
+    let reason = match &configuration.dns_protocol_candidates_applicable {
+        CapabilityValue::Available { value: true, .. } => return None,
+        CapabilityValue::Available { value: false, .. } => CapabilityReason::Other(
+            "captured resolver-source policy does not include classic DNS".into(),
+        ),
+        CapabilityValue::Unknown { reason, .. } | CapabilityValue::Unavailable { reason, .. } => {
+            reason.clone()
+        }
+    };
+    Some(Evidence {
+        id: EvidenceId(100),
+        subject: EvidenceSubject::Hostname,
+        role: EvidenceRole::CapabilityLimitation,
+        fact: EvidenceFact::CapabilityUnavailable {
+            capability: "applicable DNS protocol source".into(),
+            reason,
+        },
+    })
+}
+
+/// Key evidence for a no-formal-target hostname whose formal resolution
+/// observably consulted DNS. The decisive exchange per query type is retained;
+/// the exchanges never become targets and their purpose stays formal.
+fn formal_dns_evidence(observation: &SystemResolverObservation) -> Vec<Evidence> {
+    let mut exchanges = observation
+        .name_resolution
+        .steps
+        .iter()
+        .filter(|step| step.source == crate::NameResolutionSource::Dns)
+        .flat_map(|step| step.dns_exchanges.iter())
+        .collect::<Vec<_>>();
+    let mut decisive = Vec::with_capacity(2);
+    for query_type in [DnsQueryType::A, DnsQueryType::Aaaa] {
+        if let Some(index) = exchanges
+            .iter()
+            .rposition(|exchange| exchange.query_type == query_type)
+        {
+            decisive.push(exchanges.remove(index));
+        }
+    }
+    decisive.sort_by_key(|exchange| exchange.query_type);
+    decisive
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, exchange)| Evidence {
+            id: EvidenceId(10 + ordinal as u64),
+            subject: EvidenceSubject::Hostname,
+            role: EvidenceRole::BoundaryNarrowing,
+            fact: EvidenceFact::DnsExchange(DnsExchangeEvidence::Formal(exchange.clone())),
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -2183,30 +2295,6 @@ fn add_tcp_path_comparison(
     });
 }
 
-fn system_resolver_evidence(observation: &SystemResolverObservation) -> Evidence {
-    let summary = match &observation.result {
-        SystemResolverResult::Succeeded(addresses) => format!(
-            "succeeded with {} raw and {} formal addresses",
-            addresses.raw_addresses.len(),
-            addresses.formal_targets.len()
-        ),
-        SystemResolverResult::Failed(failure) => format!("failed: {:?}", failure.kind),
-    };
-    Evidence {
-        id: EvidenceId(1),
-        subject: EvidenceSubject::Hostname,
-        role: match &observation.result {
-            SystemResolverResult::Succeeded(addresses) if !addresses.formal_targets.is_empty() => {
-                EvidenceRole::Context
-            }
-            SystemResolverResult::Succeeded(_) | SystemResolverResult::Failed(_) => {
-                EvidenceRole::PrimaryDecision
-            }
-        },
-        fact: EvidenceFact::SystemResolverResult(summary),
-    }
-}
-
 fn skipped_current_path(
     snapshot: &InitialNetworkSnapshot,
 ) -> CapabilityValue<OperationPathContext> {
@@ -2971,11 +3059,16 @@ mod tests {
         SystemResolverObservation {
             started_at: Duration::ZERO,
             completed_at: Duration::from_millis(1),
-            result: SystemResolverResult::Failed(SystemResolverFailure {
-                kind: SystemResolverFailureKind::Timeout,
-                platform_code: Some(110),
-                platform_message: "synthetic timeout".into(),
-            }),
+            name_resolution: crate::NameResolutionObservation {
+                input_name: "example.com".into(),
+                steps: Vec::new(),
+                limitations: Vec::new(),
+                result: SystemResolverResult::Failed(SystemResolverFailure {
+                    kind: SystemResolverFailureKind::Timeout,
+                    platform_code: Some(110),
+                    platform_message: "synthetic timeout".into(),
+                }),
+            },
             provenance: provenance(),
         }
     }
@@ -2984,11 +3077,16 @@ mod tests {
         SystemResolverObservation {
             started_at: Duration::ZERO,
             completed_at: Duration::from_millis(1),
-            result: SystemResolverResult::Failed(SystemResolverFailure {
-                kind: SystemResolverFailureKind::NoUsableAddress,
-                platform_code: Some(1),
-                platform_message: "synthetic no name".into(),
-            }),
+            name_resolution: crate::NameResolutionObservation {
+                input_name: "example.com".into(),
+                steps: Vec::new(),
+                limitations: Vec::new(),
+                result: SystemResolverResult::Failed(SystemResolverFailure {
+                    kind: SystemResolverFailureKind::NoUsableAddress,
+                    platform_code: Some(1),
+                    platform_message: "synthetic no name".into(),
+                }),
+            },
             provenance: provenance(),
         }
     }
@@ -3006,7 +3104,64 @@ mod tests {
         SystemResolverObservation {
             started_at: Duration::ZERO,
             completed_at: Duration::from_millis(1),
-            result: SystemResolverResult::Succeeded(ResolverAddressSet::from_raw(targets)),
+            name_resolution: crate::NameResolutionObservation {
+                input_name: "example.com".into(),
+                steps: Vec::new(),
+                limitations: Vec::new(),
+                result: SystemResolverResult::Succeeded(ResolverAddressSet::from_raw(targets)),
+            },
+            provenance: provenance(),
+        }
+    }
+
+    fn formal_exchange(
+        query_type: DnsQueryType,
+        code: crate::DnsResponseCode,
+    ) -> crate::DnsExchangeObservation {
+        crate::DnsExchangeObservation {
+            purpose: crate::DnsExchangePurpose::FormalResolution,
+            endpoint: crate::IpEndpoint {
+                address: Ipv4Addr::new(192, 0, 2, 53).into(),
+                port: 53,
+                scope_id: None,
+            },
+            transport: crate::DnsExchangeTransport::Udp,
+            query_name: "example.com.".into(),
+            query_type,
+            outcome: crate::DnsExchangeOutcome::Response {
+                response_code: code,
+                addresses: Vec::new(),
+                aliases: Vec::new(),
+                truncated: false,
+            },
+            timing: AttemptTiming {
+                started_at: Duration::ZERO,
+                deadline_at: Duration::from_secs(1),
+                completed_at: Duration::from_millis(12),
+            },
+            provenance: provenance(),
+        }
+    }
+
+    fn formal_dns_observation(
+        result: SystemResolverResult,
+        exchanges: Vec<crate::DnsExchangeObservation>,
+    ) -> SystemResolverObservation {
+        SystemResolverObservation {
+            started_at: Duration::ZERO,
+            completed_at: Duration::from_millis(1),
+            name_resolution: crate::NameResolutionObservation {
+                input_name: "example.com".into(),
+                steps: vec![crate::NameResolutionStep {
+                    source: crate::NameResolutionSource::Dns,
+                    query_names: vec!["example.com".into()],
+                    dns_exchanges: exchanges,
+                    outcome: crate::NameResolutionStepOutcome::NotFound,
+                    provenance: provenance(),
+                }],
+                limitations: Vec::new(),
+                result,
+            },
             provenance: provenance(),
         }
     }
@@ -3405,18 +3560,30 @@ mod tests {
         assert!(completed.targets.is_empty());
         assert_eq!(completed.resolver_diagnostics.len(), 1);
         assert_eq!(completed.resolver_diagnostics[0].attempts.len(), 2);
-        let summaries = completed
+        let diagnostic = completed
             .key_evidence
             .iter()
             .filter_map(|evidence| match &evidence.fact {
-                EvidenceFact::DirectDnsResult(summary) => Some(summary),
+                EvidenceFact::DnsExchange(DnsExchangeEvidence::Diagnostic(id)) => Some(*id),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(summaries.len(), 2);
-        assert!(summaries.iter().all(|summary| {
-            summary.contains("1 address(es), 1 alias(es)") && !summary.contains("untrusted")
-        }));
+        assert_eq!(diagnostic.len(), 2);
+        for id in &diagnostic {
+            let attempt = completed.resolver_diagnostics[0]
+                .attempts
+                .iter()
+                .find(|attempt| attempt.id == *id)
+                .expect("diagnostic exchange attempt");
+            let AttemptOutcome::Dns(DnsAttemptResult::Response {
+                addresses, aliases, ..
+            }) = &attempt.outcome
+            else {
+                panic!("diagnostic exchange must be a typed DNS response");
+            };
+            assert_eq!(addresses.len(), 1);
+            assert_eq!(aliases, &vec!["untrusted\nalias.example".to_owned()]);
+        }
         assert_eq!(io.tcp_calls.load(Ordering::SeqCst), 0);
         assert_eq!(io.icmp_calls.load(Ordering::SeqCst), 0);
         assert!(matches!(
@@ -3455,10 +3622,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn negative_and_zero_address_resolution_never_probe_or_succeed() {
+    async fn negative_resolution_runs_bounded_dns_diagnosis_without_forming_targets() {
         let definitive_io =
             ScriptedIo::new(with_dns_resolver(snapshot(Some(RouteBehavior::Unicast))))
                 .with_resolver(definitive_resolver_failure());
+        definitive_io.push_udp(DnsQueryType::A, &[dns_response()]);
+        definitive_io.push_udp(DnsQueryType::Aaaa, &[dns_response()]);
         let definitive = completed(
             run_diagnostic(
                 parse_request("example.com", None).expect("valid request"),
@@ -3471,7 +3640,11 @@ mod tests {
             definitive.conclusion,
             Conclusion::HostnameResolutionNoUsableAddress
         );
-        assert!(definitive.resolver_diagnostics.is_empty());
+        assert_eq!(definitive.resolver_diagnostics.len(), 1);
+        assert_eq!(definitive.resolver_diagnostics[0].attempts.len(), 2);
+        assert!(definitive.targets.is_empty());
+        assert_eq!(definitive_io.tcp_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(definitive_io.icmp_calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             definitive.exit_status(),
             crate::ExitStatus::DiagnosticNonSuccess
@@ -3490,6 +3663,119 @@ mod tests {
         assert_eq!(empty.conclusion, Conclusion::HostnameNoFormalTargets);
         assert!(empty.targets.is_empty());
         assert_eq!(empty.exit_status(), crate::ExitStatus::DiagnosticNonSuccess);
+    }
+
+    #[tokio::test]
+    async fn observed_formal_dns_never_triggers_extra_diagnostic_traffic() {
+        let result = SystemResolverResult::Failed(SystemResolverFailure {
+            kind: SystemResolverFailureKind::NoUsableAddress,
+            platform_code: None,
+            platform_message: "the executed Linux NSS policy returned no usable address".into(),
+        });
+        let exchanges = vec![
+            formal_exchange(DnsQueryType::A, crate::DnsResponseCode::NxDomain),
+            formal_exchange(DnsQueryType::Aaaa, crate::DnsResponseCode::NxDomain),
+        ];
+        let io = ScriptedIo::new(with_dns_resolver(snapshot(Some(RouteBehavior::Unicast))))
+            .with_resolver(formal_dns_observation(result, exchanges));
+        let completed = completed(
+            run_diagnostic(
+                parse_request("example.com", None).expect("valid request"),
+                &io,
+                &CancellationToken::new(),
+            )
+            .await,
+        );
+
+        assert!(completed.targets.is_empty());
+        assert!(completed.resolver_diagnostics.is_empty());
+        assert_eq!(io.max_active_dns.load(Ordering::SeqCst), 0);
+        assert_eq!(io.tcp_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(io.icmp_calls.load(Ordering::SeqCst), 0);
+        let formal = completed
+            .key_evidence
+            .iter()
+            .filter_map(|evidence| match &evidence.fact {
+                EvidenceFact::DnsExchange(DnsExchangeEvidence::Formal(exchange)) => {
+                    Some(exchange.query_type)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(formal, vec![DnsQueryType::A, DnsQueryType::Aaaa]);
+        assert_eq!(
+            completed.exit_status(),
+            crate::ExitStatus::DiagnosticNonSuccess
+        );
+    }
+
+    #[test]
+    fn formal_dns_evidence_keeps_only_the_decisive_exchange_per_query_type() {
+        let result = SystemResolverResult::Failed(SystemResolverFailure {
+            kind: SystemResolverFailureKind::NoUsableAddress,
+            platform_code: None,
+            platform_message: "no usable address".into(),
+        });
+        let exchanges = vec![
+            formal_exchange(DnsQueryType::A, crate::DnsResponseCode::NxDomain),
+            formal_exchange(DnsQueryType::A, crate::DnsResponseCode::NxDomain),
+            formal_exchange(DnsQueryType::Aaaa, crate::DnsResponseCode::NxDomain),
+            formal_exchange(DnsQueryType::Aaaa, crate::DnsResponseCode::NxDomain),
+        ];
+        let observation = formal_dns_observation(result, exchanges);
+        let evidence = formal_dns_evidence(&observation);
+
+        assert_eq!(evidence.len(), 2);
+        let EvidenceFact::DnsExchange(DnsExchangeEvidence::Formal(first)) = &evidence[0].fact
+        else {
+            panic!("expected formal exchange evidence");
+        };
+        let EvidenceFact::DnsExchange(DnsExchangeEvidence::Formal(second)) = &evidence[1].fact
+        else {
+            panic!("expected formal exchange evidence");
+        };
+        assert_eq!(first.query_type, DnsQueryType::A);
+        assert_eq!(second.query_type, DnsQueryType::Aaaa);
+        assert_eq!(first.timing.completed_at, Duration::from_millis(12));
+    }
+
+    #[tokio::test]
+    async fn hosts_only_negative_never_sends_diagnostic_dns_when_dns_is_not_applicable() {
+        let result = SystemResolverResult::Failed(SystemResolverFailure {
+            kind: SystemResolverFailureKind::NoUsableAddress,
+            platform_code: None,
+            platform_message: "no usable address".into(),
+        });
+        let mut hosts_observation = formal_dns_observation(result, Vec::new());
+        hosts_observation.name_resolution.steps = vec![crate::NameResolutionStep {
+            source: crate::NameResolutionSource::Hosts,
+            query_names: Vec::new(),
+            dns_exchanges: Vec::new(),
+            outcome: crate::NameResolutionStepOutcome::NotFound,
+            provenance: provenance(),
+        }];
+        let mut initial = with_dns_resolver(snapshot(Some(RouteBehavior::Unicast)));
+        let CapabilityValue::Available { value, .. } = &mut initial.resolver_configuration else {
+            unreachable!("test resolver configuration is available");
+        };
+        value.dns_protocol_candidates_applicable = CapabilityValue::available(false, provenance());
+        let io = ScriptedIo::new(initial).with_resolver(hosts_observation);
+        let completed = completed(
+            run_diagnostic(
+                parse_request("example.com", None).expect("valid request"),
+                &io,
+                &CancellationToken::new(),
+            )
+            .await,
+        );
+
+        assert!(completed.resolver_diagnostics.is_empty());
+        assert_eq!(io.max_active_dns.load(Ordering::SeqCst), 0);
+        assert!(completed.key_evidence.iter().any(|evidence| matches!(
+            &evidence.fact,
+            EvidenceFact::CapabilityUnavailable { capability, .. }
+                if capability == "applicable DNS protocol source"
+        )));
     }
 
     #[tokio::test]

@@ -111,8 +111,137 @@ pub enum SystemResolverResult {
 pub struct SystemResolverObservation {
     pub started_at: Duration,
     pub completed_at: Duration,
-    pub result: SystemResolverResult,
+    pub name_resolution: NameResolutionObservation,
     pub provenance: Provenance,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NameResolutionSource {
+    Hosts,
+    Dns,
+    SystemResolverOpaque,
+    OtherPlatformSource,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DnsExchangePurpose {
+    FormalResolution,
+    Diagnostic,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DnsExchangeTransport {
+    Udp,
+    Tcp,
+}
+
+/// Typed DNS response codes for the meanings Reach itself presents. Unknown
+/// codes stay representable without guessing their meaning.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum DnsResponseCode {
+    NoError,
+    FormErr,
+    ServFail,
+    NxDomain,
+    NotImp,
+    Refused,
+    Other(u16),
+}
+
+impl From<u16> for DnsResponseCode {
+    fn from(code: u16) -> Self {
+        match code {
+            0 => Self::NoError,
+            1 => Self::FormErr,
+            2 => Self::ServFail,
+            3 => Self::NxDomain,
+            4 => Self::NotImp,
+            5 => Self::Refused,
+            other => Self::Other(other),
+        }
+    }
+}
+
+impl From<DnsResponseCode> for u16 {
+    fn from(code: DnsResponseCode) -> Self {
+        match code {
+            DnsResponseCode::NoError => 0,
+            DnsResponseCode::FormErr => 1,
+            DnsResponseCode::ServFail => 2,
+            DnsResponseCode::NxDomain => 3,
+            DnsResponseCode::NotImp => 4,
+            DnsResponseCode::Refused => 5,
+            DnsResponseCode::Other(other) => other,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DnsExchangeOutcome {
+    Response {
+        response_code: DnsResponseCode,
+        addresses: Vec<IpAddr>,
+        aliases: Vec<String>,
+        truncated: bool,
+    },
+    TransportError {
+        os_code: Option<i32>,
+    },
+    ProtocolError,
+    Timeout,
+}
+
+/// One observed DNS exchange with the exact endpoint Reach actually used.
+///
+/// `purpose` is explicit: no caller may infer formal versus diagnostic
+/// meaning from list ordering. A configured candidate can never appear here
+/// unless this specific exchange is proven to have used it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DnsExchangeObservation {
+    pub purpose: DnsExchangePurpose,
+    pub endpoint: IpEndpoint,
+    pub transport: DnsExchangeTransport,
+    pub query_name: String,
+    pub query_type: DnsQueryType,
+    pub outcome: DnsExchangeOutcome,
+    pub timing: AttemptTiming,
+    pub provenance: Provenance,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NameResolutionStepOutcome {
+    Found,
+    NotFound,
+    Unavailable { reason: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NameResolutionStep {
+    pub source: NameResolutionSource,
+    /// Exact DNS query names actually used by this step, in semantic order.
+    pub query_names: Vec<String>,
+    /// Observed formal-resolution DNS exchanges for this step, in the order
+    /// Reach initiated them.
+    pub dns_exchanges: Vec<DnsExchangeObservation>,
+    pub outcome: NameResolutionStepOutcome,
+    pub provenance: Provenance,
+}
+
+/// Structured name-resolution facts for the requested hostname.
+///
+/// `result` stays the single source of truth for formal target formation.
+/// `steps` and `limitations` are observability facts that can never rewrite
+/// the system resolver outcome.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NameResolutionObservation {
+    pub input_name: String,
+    pub steps: Vec<NameResolutionStep>,
+    /// Explicit capability boundaries observed during resolution, e.g. an
+    /// opaque platform system resolver that does not expose its exact formal
+    /// DNS server identity.
+    pub limitations: Vec<String>,
+    pub result: SystemResolverResult,
 }
 
 impl ResolverAddressSet {
@@ -335,7 +464,7 @@ pub enum AttemptSubject {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum DnsQueryType {
     A,
     Aaaa,
